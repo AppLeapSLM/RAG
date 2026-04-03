@@ -29,9 +29,13 @@ fi
 echo "[AppLeap] Installing Python dependencies..."
 cd /workspace/appleap-rag/appleap-rag && pip install -e ".[parsing]" > /dev/null 2>&1
 
-echo "[AppLeap] Starting Ollama..."
+echo "[AppLeap] Installing Ollama..."
+if ! command -v ollama &> /dev/null; then
+    curl -fsSL https://ollama.com/install.sh | sh > /dev/null 2>&1
+fi
 export OLLAMA_MODELS=/workspace/ollama
 mkdir -p /workspace/ollama
+echo "[AppLeap] Starting Ollama..."
 ollama serve &
 sleep 5
 
