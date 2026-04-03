@@ -1,0 +1,43 @@
+import uuid
+from datetime import datetime, timezone
+
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import DateTime, String, Text
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from backend.config import settings
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Document(Base):
+    __tablename__ = "documents"
+
+    id: Mapped[str] = mapped_column(
+        String, primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    source: Mapped[str] = mapped_column(String, nullable=False)
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    metadata_: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)
+
+
+class Chunk(Base):
+    __tablename__ = "chunks"
+
+    id: Mapped[str] = mapped_column(
+        String, primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    document_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    chunk_index: Mapped[int] = mapped_column(nullable=False)
+    embedding = mapped_column(Vector(settings.embedding_dim))
+    metadata_: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
