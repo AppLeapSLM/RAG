@@ -43,5 +43,25 @@ echo "[AppLeap] Pulling models (skip if cached)..."
 ollama pull phi4 2>/dev/null
 ollama pull nomic-embed-text 2>/dev/null
 
+echo "[AppLeap] Starting idle shutdown watchdog (30 min)..."
+RUNPOD_API_KEY="${RUNPOD_API_KEY}"
+POD_ID="${RUNPOD_POD_ID:-$(cat /etc/hostname)}"
+IDLE_MINUTES=30
+STAMP_FILE="/tmp/appleap-last-request"
+touch "$STAMP_FILE"
+
+(while true; do
+    sleep 300
+    if [ -f "$STAMP_FILE" ]; then
+        LAST_MODIFIED=$(stat -c %Y "$STAMP_FILE")
+        NOW=$(date +%s)
+        AGE_MINUTES=$(( (NOW - LAST_MODIFIED) / 60 ))
+        if [ "$AGE_MINUTES" -ge "$IDLE_MINUTES" ]; then
+            echo "[AppLeap] Idle for ${AGE_MINUTES} minutes. Stopping pod."
+            curl -s -H "Authorization: Bearer ${RUNPOD_API_KEY}" -H "Content-Type: application/json" -d "{\"query\":\"mutation { podStop(input: {podId: \\\"${POD_ID}\\\"}) { id } }\"}" https://api.runpod.io/graphql > /dev/null 2>&1
+        fi
+    fi
+done) &
+
 echo "[AppLeap] Starting server..."
 cd /workspace/appleap-rag/appleap-rag && uvicorn backend.main:app --host 0.0.0.0 --port 8000
