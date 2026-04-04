@@ -41,17 +41,19 @@ def chunk_parsed_document(
     )
 
     if effective == "by_title":
-        return _chunk_by_title(doc)
+        raw = _chunk_by_title(doc)
     elif effective == "by_similarity":
         raise RuntimeError(
             "by_similarity requires async (calls embed_batch). "
             "Use chunk_parsed_document_async() instead."
         )
     elif effective == "naive":
-        return _chunk_naive(doc)
+        raw = _chunk_naive(doc)
     else:
         logger.warning("Unknown strategy %s, falling back to by_title", effective)
-        return _chunk_by_title(doc)
+        raw = _chunk_by_title(doc)
+
+    return _apply_context_headers(raw, doc)
 
 
 async def chunk_parsed_document_async(
@@ -67,9 +69,105 @@ async def chunk_parsed_document_async(
     effective = strategy or _detect_strategy(doc)
 
     if effective == "by_similarity":
-        return await _chunk_by_similarity(doc)
+        raw = await _chunk_by_similarity(doc)
+        return _apply_context_headers(raw, doc)
     else:
         return await asyncio.to_thread(chunk_parsed_document, doc, effective)
+
+
+# ── Contextual chunk headers ─────────────────────────────────────────
+
+
+def _apply_context_headers(
+    chunks: list[dict[str, Any]],
+    doc: ParsedDocument,
+) -> list[dict[str, Any]]:
+    """Prepend a contextual header to every chunk and enrich metadata.
+
+    The header becomes part of the text that gets embedded, so the embedding
+    captures document context (title, section, source, author, path).
+    """
+    total = len(chunks)
+    title_texts = frozenset(
+        el.text for el in doc.elements if el.element_type == ElementType.TITLE
+    )
+
+    for i, chunk in enumerate(chunks):
+        section = _extract_section(chunk["text"], title_texts)
+        header = _build_header(doc, section, i, total)
+        chunk["text"] = header + chunk["text"]
+        chunk["metadata"]["section"] = section
+        chunk["metadata"]["chunk_position"] = i + 1
+        chunk["metadata"]["total_chunks"] = total
+
+    return chunks
+
+
+def _build_header(
+    doc: ParsedDocument,
+    section: str,
+    chunk_index: int,
+    total_chunks: int,
+) -> str:
+    """Build a bracketed header line from available metadata."""
+    parts: list[str] = []
+    meta = doc.metadata
+
+    # Document title — use explicit title from metadata, fall back to filename
+    title = meta.get("title") or doc.filename
+    if title:
+        parts.append(f"Document: {title}")
+
+    # Section hierarchy (e.g. "Kubernetes Guide > Prerequisites")
+    if section:
+        parts.append(f"Section: {section}")
+
+    # Source system (skip generic sources)
+    source = meta.get("source", "")
+    if source and source not in ("manual", "upload", ""):
+        parts.append(f"Source: {source}")
+
+    # Folder / project path (from connectors)
+    folder = meta.get("folder_path", "")
+    if folder and folder != "/":
+        parts.append(f"Path: {folder}")
+
+    # Author / owner
+    author = meta.get("owner_email", "")
+    if author:
+        parts.append(f"Author: {author}")
+
+    # Last modified — truncate to date if ISO timestamp
+    modified = meta.get("last_modified", "")
+    if modified:
+        parts.append(f"Modified: {modified[:10]}")
+
+    # Chunk position
+    parts.append(f"Part {chunk_index + 1} of {total_chunks}")
+
+    return "[" + " | ".join(parts) + "]\n"
+
+
+def _extract_section(chunk_text: str, title_texts: frozenset[str]) -> str:
+    """Extract section title hierarchy from the start of a chunk.
+
+    Walks the leading lines of the chunk and collects consecutive titles,
+    producing a path like "Kubernetes Guide > Prerequisites".
+    """
+    if not title_texts:
+        return ""
+
+    sections: list[str] = []
+    for line in chunk_text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if line in title_texts:
+            sections.append(line)
+        else:
+            break  # first non-title line — stop
+
+    return " > ".join(sections)
 
 
 # ── Strategy auto-detection ───────────────────────────────────────────
@@ -159,12 +257,23 @@ async def _chunk_by_similarity(doc: ParsedDocument) -> list[dict[str, Any]]:
         if sim < settings.similarity_threshold:
             cut_indices.append(i + 1)
 
-    # Group elements into segments
+    # Group elements into segments with overlap.
+    # Carry trailing elements from each segment into the next so boundary
+    # content appears in both chunks' embeddings.
+    overlap_chars = settings.chunk_overlap
     segments: list[list[int]] = []
     start = 0
     for cut in cut_indices:
         segments.append(list(range(start, cut)))
-        start = cut
+        # Walk backwards from the cut to find overlap elements
+        overlap_start = cut
+        char_count = 0
+        for j in range(cut - 1, start - 1, -1):
+            char_count += len(doc.elements[j].text)
+            if char_count >= overlap_chars:
+                overlap_start = j
+                break
+        start = min(overlap_start, cut)  # overlap elements join the next segment
     segments.append(list(range(start, len(doc.elements))))
 
     # Convert segments to chunks

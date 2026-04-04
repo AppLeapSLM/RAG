@@ -12,28 +12,33 @@ class Settings(BaseSettings):
 
     # Chunking (legacy — used by naive fallback only)
     chunk_size: int = 512
-    chunk_overlap: int = 50
+    chunk_overlap: int = 200
 
     # Parsing (Unstructured.io)
     parsing_strategy: str = "auto"  # "auto", "fast", "hi_res", "ocr_only"
 
     # Chunking (Unstructured.io / content-type-aware router)
     chunking_strategy: str = "auto"  # "auto", "by_title", "by_similarity", "naive"
-    chunk_max_characters: int = 1500
-    chunk_new_after_n_chars: int = 1200
-    chunk_combine_under_n_chars: int = 500
+    chunk_max_characters: int = 3000
+    chunk_new_after_n_chars: int = 2500
+    chunk_combine_under_n_chars: int = 800
     # Semantic chunking (custom by_similarity)
     similarity_threshold: float = 0.75
-    similarity_max_characters: int = 1500
+    similarity_max_characters: int = 3000
 
     # File upload
     max_upload_size_mb: int = 50
 
     # Retrieval
     top_k: int = 5
+    neighbor_window: int = 1  # pull ±N adjacent chunks for context
+    max_context_chars: int = 40000  # ~10K tokens hard cap sent to LLM
 
     # Embedding dimension (Nomic produces 768-dim vectors)
     embedding_dim: int = 768
+
+    # Google Drive connector
+    google_drive_credentials_path: str = ""
 
     model_config = {"env_prefix": "APPLEAP_"}
 
