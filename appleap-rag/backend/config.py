@@ -31,7 +31,7 @@ class Settings(BaseSettings):
 
     # Retrieval
     top_k: int = 5
-    neighbor_window: int = 1  # pull ±N adjacent chunks for context
+    neighbor_window: int = 0  # pull ±N adjacent chunks (0 = disabled)
     max_context_chars: int = 40000  # ~10K tokens hard cap sent to LLM
 
     # Embedding dimension (Nomic produces 768-dim vectors)
