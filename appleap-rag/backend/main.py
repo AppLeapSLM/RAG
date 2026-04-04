@@ -40,6 +40,31 @@ async def lifespan(app: FastAPI):
             __import__("sqlalchemy").text("CREATE EXTENSION IF NOT EXISTS vector")
         )
         await conn.run_sync(Base.metadata.create_all)
+
+        # Full-text search: add tsvector column + GIN index + auto-populate trigger
+        await conn.execute(__import__("sqlalchemy").text("""
+            ALTER TABLE chunks ADD COLUMN IF NOT EXISTS search_vector tsvector
+        """))
+        await conn.execute(__import__("sqlalchemy").text("""
+            CREATE INDEX IF NOT EXISTS idx_chunks_search_vector
+            ON chunks USING gin(search_vector)
+        """))
+        await conn.execute(__import__("sqlalchemy").text("""
+            CREATE OR REPLACE FUNCTION chunks_search_vector_update() RETURNS trigger AS $$
+            BEGIN
+                NEW.search_vector := to_tsvector('english', NEW.content);
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+        """))
+        await conn.execute(__import__("sqlalchemy").text("""
+            DROP TRIGGER IF EXISTS chunks_search_vector_trigger ON chunks
+        """))
+        await conn.execute(__import__("sqlalchemy").text("""
+            CREATE TRIGGER chunks_search_vector_trigger
+            BEFORE INSERT OR UPDATE ON chunks
+            FOR EACH ROW EXECUTE FUNCTION chunks_search_vector_update()
+        """))
     yield
     await engine.dispose()
 
