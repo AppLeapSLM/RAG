@@ -21,13 +21,16 @@ logger = logging.getLogger(__name__)
 # ── Public API ────────────────────────────────────────────────────────
 
 
-def chunk_parsed_document(
+async def chunk_parsed_document_async(
     doc: ParsedDocument,
     strategy: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Route a parsed document to the appropriate chunking strategy (sync).
+    """Route a parsed document to the appropriate chunking strategy.
 
-    Raises RuntimeError if by_similarity is selected — use the async version.
+    by_title uses the "Parse Big, Store Small" hybrid:
+    1. Unstructured groups elements by headings (up to 30K chars — structural only)
+    2. Blocks under similarity_max_characters (3000) are kept as-is
+    3. Oversized blocks are passed to by_similarity for semantic splitting
     """
     if not doc.elements:
         return []
@@ -41,38 +44,16 @@ def chunk_parsed_document(
     )
 
     if effective == "by_title":
-        raw = _chunk_by_title(doc)
+        raw = await _chunk_by_title_hybrid(doc)
     elif effective == "by_similarity":
-        raise RuntimeError(
-            "by_similarity requires async (calls embed_batch). "
-            "Use chunk_parsed_document_async() instead."
-        )
+        raw = await _chunk_by_similarity(doc)
     elif effective == "naive":
         raw = _chunk_naive(doc)
     else:
         logger.warning("Unknown strategy %s, falling back to by_title", effective)
-        raw = _chunk_by_title(doc)
+        raw = await _chunk_by_title_hybrid(doc)
 
     return _apply_context_headers(raw, doc)
-
-
-async def chunk_parsed_document_async(
-    doc: ParsedDocument,
-    strategy: str | None = None,
-) -> list[dict[str, Any]]:
-    """Async version — supports all strategies including by_similarity."""
-    import asyncio
-
-    if not doc.elements:
-        return []
-
-    effective = strategy or _detect_strategy(doc)
-
-    if effective == "by_similarity":
-        raw = await _chunk_by_similarity(doc)
-        return _apply_context_headers(raw, doc)
-    else:
-        return await asyncio.to_thread(chunk_parsed_document, doc, effective)
 
 
 # ── Contextual chunk headers ─────────────────────────────────────────
@@ -190,44 +171,101 @@ def _detect_strategy(doc: ParsedDocument) -> str:
     return "by_title" if has_titles else "by_similarity"
 
 
-# ── by_title (Unstructured native) ───────────────────────────────────
+# ── by_title hybrid: Parse Big, Store Small ──────────────────────────
 
 
-def _chunk_by_title(doc: ParsedDocument) -> list[dict[str, Any]]:
-    """Use Unstructured's chunk_by_title on parsed elements."""
-    # Convert ParsedElements → Unstructured Element objects
-    unstructured_elements = []
-    for el in doc.elements:
-        if el.element_type == ElementType.TITLE:
-            unstructured_elements.append(Title(text=el.text))
-        elif el.element_type == ElementType.TABLE:
-            unstructured_elements.append(Table(text=el.text))
-        elif el.element_type == ElementType.LIST_ITEM:
-            unstructured_elements.append(ListItem(text=el.text))
-        else:
-            unstructured_elements.append(NarrativeText(text=el.text))
+async def _chunk_by_title_hybrid(doc: ParsedDocument) -> list[dict[str, Any]]:
+    """Hybrid chunking: Unstructured groups by headings, oversized blocks go to by_similarity.
 
-    chunks = chunk_by_title(
+    1. Unstructured's chunk_by_title groups elements under headings (limit 30K — structural only)
+    2. Each block is checked against similarity_max_characters (3000)
+    3. Small blocks → kept as-is
+    4. Oversized blocks → split semantically via by_similarity
+    """
+    import asyncio
+
+    # Step 1: Unstructured groups by headings with a large limit
+    unstructured_elements = _to_unstructured_elements(doc)
+
+    blocks = await asyncio.to_thread(
+        chunk_by_title,
         unstructured_elements,
-        max_characters=settings.chunk_max_characters,
-        new_after_n_chars=settings.chunk_new_after_n_chars,
-        overlap=settings.chunk_overlap,
+        max_characters=settings.chunk_max_characters,       # 30000 — structural only
+        new_after_n_chars=settings.chunk_new_after_n_chars,  # 29000
+        overlap=0,  # we handle overlap in by_similarity, not here
         combine_text_under_n_chars=settings.chunk_combine_under_n_chars,
     )
 
+    max_chunk_size = settings.similarity_max_characters  # 3000 — the real ceiling
+
+    # Step 2: Check each block — keep small ones, split large ones
     result: list[dict[str, Any]] = []
-    for chunk in chunks:
-        text = chunk.text.strip()
+
+    for block in blocks:
+        text = block.text.strip()
         if not text:
             continue
-        result.append(
-            {
-                "text": text,
-                "metadata": {**doc.metadata},
-                "element_types": [type(chunk).__name__],
-            }
-        )
+
+        if len(text) <= max_chunk_size:
+            # Small block — keep as-is
+            result.append(
+                {
+                    "text": text,
+                    "metadata": {**doc.metadata},
+                    "element_types": [type(block).__name__],
+                }
+            )
+        else:
+            # Oversized block — split semantically
+            logger.info(
+                "Block too large (%d chars), splitting with by_similarity",
+                len(text),
+            )
+            block_elements = _text_to_elements(text)
+            block_doc = ParsedDocument(
+                filename=doc.filename,
+                filetype=doc.filetype,
+                elements=block_elements,
+                metadata=doc.metadata,
+            )
+            sub_chunks = await _chunk_by_similarity(block_doc)
+            result.extend(sub_chunks)
+
     return result
+
+
+def _to_unstructured_elements(doc: ParsedDocument) -> list:
+    """Convert ParsedElements to Unstructured Element objects."""
+    elements = []
+    for el in doc.elements:
+        if el.element_type == ElementType.TITLE:
+            elements.append(Title(text=el.text))
+        elif el.element_type == ElementType.TABLE:
+            elements.append(Table(text=el.text))
+        elif el.element_type == ElementType.LIST_ITEM:
+            elements.append(ListItem(text=el.text))
+        else:
+            elements.append(NarrativeText(text=el.text))
+    return elements
+
+
+def _text_to_elements(text: str) -> list[ParsedElement]:
+    """Convert a block of text back into ParsedElements for by_similarity.
+
+    Splits on double-newline to recover paragraph-level elements.
+    """
+    elements: list[ParsedElement] = []
+    for para in text.split("\n\n"):
+        para = para.strip()
+        if para:
+            elements.append(
+                ParsedElement(
+                    text=para,
+                    element_type=ElementType.NARRATIVE_TEXT,
+                    metadata={},
+                )
+            )
+    return elements
 
 
 # ── by_similarity (custom, async) ────────────────────────────────────
@@ -239,11 +277,25 @@ async def _chunk_by_similarity(doc: ParsedDocument) -> list[dict[str, Any]]:
     1. Embed all elements in one batch
     2. Compute cosine similarity between consecutive embeddings
     3. Cut where similarity < threshold
-    4. Group into chunks, split if exceeding max_characters
+    4. Group into chunks, split if exceeding similarity_max_characters
     """
     from backend.embedding.embedder import embed_batch
 
     element_texts = [el.text for el in doc.elements]
+
+    # Single element — just return it
+    if len(element_texts) <= 1:
+        text = element_texts[0] if element_texts else ""
+        if not text:
+            return []
+        return [
+            {
+                "text": text,
+                "metadata": {**doc.metadata},
+                "element_types": [doc.elements[0].element_type.value],
+            }
+        ]
+
     embeddings = await embed_batch(element_texts)
 
     # Consecutive cosine similarities
@@ -258,8 +310,6 @@ async def _chunk_by_similarity(doc: ParsedDocument) -> list[dict[str, Any]]:
             cut_indices.append(i + 1)
 
     # Group elements into segments with overlap.
-    # Carry trailing elements from each segment into the next so boundary
-    # content appears in both chunks' embeddings.
     overlap_chars = settings.chunk_overlap
     segments: list[list[int]] = []
     start = 0
@@ -273,7 +323,7 @@ async def _chunk_by_similarity(doc: ParsedDocument) -> list[dict[str, Any]]:
             if char_count >= overlap_chars:
                 overlap_start = j
                 break
-        start = min(overlap_start, cut)  # overlap elements join the next segment
+        start = min(overlap_start, cut)
     segments.append(list(range(start, len(doc.elements))))
 
     # Convert segments to chunks
@@ -312,7 +362,7 @@ async def _chunk_by_similarity(doc: ParsedDocument) -> list[dict[str, Any]]:
 def _chunk_naive(doc: ParsedDocument) -> list[dict[str, Any]]:
     """Simple character-based splitting for single-element docs."""
     full_text = "\n\n".join(el.text for el in doc.elements)
-    size = settings.chunk_max_characters
+    size = settings.similarity_max_characters
     overlap = settings.chunk_overlap
 
     paragraphs = [p.strip() for p in full_text.split("\n\n") if p.strip()]
@@ -386,19 +436,3 @@ def _split_segment_by_size(
             }
         )
     return result
-
-
-# ── Legacy API (backward compat) ─────────────────────────────────────
-
-
-def chunk_text(
-    text: str,
-    chunk_size: int = settings.chunk_size,
-    overlap: int = settings.chunk_overlap,
-) -> list[str]:
-    """DEPRECATED: Use chunk_parsed_document() or chunk_parsed_document_async()."""
-    from backend.parsing.parser import parse_text
-
-    doc = parse_text(text)
-    chunks = _chunk_naive(doc)
-    return [c["text"] for c in chunks]

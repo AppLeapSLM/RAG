@@ -19,10 +19,11 @@ class Settings(BaseSettings):
 
     # Chunking (Unstructured.io / content-type-aware router)
     chunking_strategy: str = "auto"  # "auto", "by_title", "by_similarity", "naive"
-    chunk_max_characters: int = 3000
-    chunk_new_after_n_chars: int = 2500
+    # Unstructured groups by headings up to this limit (Parse Big)
+    chunk_max_characters: int = 30000
+    chunk_new_after_n_chars: int = 29000
     chunk_combine_under_n_chars: int = 800
-    # Semantic chunking (custom by_similarity)
+    # Semantic chunking — the real chunk size ceiling (Store Small)
     similarity_threshold: float = 0.75
     similarity_max_characters: int = 3000
 

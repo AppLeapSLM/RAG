@@ -19,9 +19,9 @@ async def keyword_search(
     """
     stmt = text("""
         SELECT id, document_id, content, chunk_index, embedding, metadata, created_at,
-               ts_rank_cd(search_vector, plainto_tsquery('english', :query)) AS rank
+               ts_rank_cd(search_vector, websearch_to_tsquery('english', :query)) AS rank
         FROM chunks
-        WHERE search_vector @@ plainto_tsquery('english', :query)
+        WHERE search_vector @@ websearch_to_tsquery('english', :query)
         ORDER BY rank DESC
         LIMIT :top_k
     """)

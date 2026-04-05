@@ -52,7 +52,10 @@ async def lifespan(app: FastAPI):
         await conn.execute(__import__("sqlalchemy").text("""
             CREATE OR REPLACE FUNCTION chunks_search_vector_update() RETURNS trigger AS $$
             BEGIN
-                NEW.search_vector := to_tsvector('english', NEW.content);
+                NEW.search_vector :=
+                    setweight(to_tsvector('english', NEW.content), 'A') ||
+                    setweight(to_tsvector('english', coalesce(NEW.metadata->>'section', '')), 'B') ||
+                    setweight(to_tsvector('english', coalesce(NEW.metadata->>'title', '')), 'C');
                 RETURN NEW;
             END;
             $$ LANGUAGE plpgsql
