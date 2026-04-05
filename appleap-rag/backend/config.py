@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     # Unstructured groups by headings up to this limit (Parse Big)
     chunk_max_characters: int = 30000
     chunk_new_after_n_chars: int = 29000
-    chunk_combine_under_n_chars: int = 800
+    chunk_combine_under_n_chars: int = 1500
     # Semantic chunking — the real chunk size ceiling (Store Small)
     similarity_threshold: float = 0.75
     similarity_max_characters: int = 3000
