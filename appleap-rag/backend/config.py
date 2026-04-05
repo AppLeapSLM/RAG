@@ -10,22 +10,12 @@ class Settings(BaseSettings):
     embedding_model: str = "nomic-embed-text"
     llm_model: str = "phi4"
 
-    # Chunking (legacy — used by naive fallback only)
-    chunk_size: int = 512
-    chunk_overlap: int = 200
-
-    # Parsing (Unstructured.io)
+    # Parsing (Unstructured.io — used only as file parser, not for chunking)
     parsing_strategy: str = "auto"  # "auto", "fast", "hi_res", "ocr_only"
 
-    # Chunking (Unstructured.io / content-type-aware router)
-    chunking_strategy: str = "auto"  # "auto", "by_title", "by_similarity", "naive"
-    # Unstructured groups by headings up to this limit (Parse Big)
-    chunk_max_characters: int = 30000
-    chunk_new_after_n_chars: int = 29000
-    chunk_combine_under_n_chars: int = 1500
-    # Semantic chunking — the real chunk size ceiling (Store Small)
-    similarity_threshold: float = 0.75
-    similarity_max_characters: int = 3000
+    # Chunking (recursive character splitter)
+    chunk_size: int = 3000          # hard max characters per chunk
+    chunk_overlap: int = 200        # characters of overlap between consecutive chunks
 
     # File upload
     max_upload_size_mb: int = 50

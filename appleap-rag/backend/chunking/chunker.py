@@ -1,21 +1,15 @@
 from __future__ import annotations
 
 import logging
-import math
 from typing import Any
 
-from unstructured.chunking.title import chunk_by_title
-from unstructured.documents.elements import (
-    ListItem,
-    NarrativeText,
-    Table,
-    Title,
-)
-
 from backend.config import settings
-from backend.parsing.base import ElementType, ParsedDocument, ParsedElement
+from backend.parsing.base import ElementType, ParsedDocument
 
 logger = logging.getLogger(__name__)
+
+# Default separator hierarchy: paragraph → line → word → character
+DEFAULT_SEPARATORS = ["\n\n", "\n", " ", ""]
 
 
 # ── Public API ────────────────────────────────────────────────────────
@@ -23,37 +17,191 @@ logger = logging.getLogger(__name__)
 
 async def chunk_parsed_document_async(
     doc: ParsedDocument,
-    strategy: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Route a parsed document to the appropriate chunking strategy.
+    """Convert a parsed document into chunks ready for embedding and storage.
 
-    by_title uses the "Parse Big, Store Small" hybrid:
-    1. Unstructured groups elements by headings (up to 30K chars — structural only)
-    2. Blocks under similarity_max_characters (3000) are kept as-is
-    3. Oversized blocks are passed to by_similarity for semantic splitting
+    1. Join all parsed elements into a single clean text string
+    2. Split using the recursive character splitter
+    3. Apply contextual headers to each chunk
     """
     if not doc.elements:
         return []
 
-    effective = strategy or _detect_strategy(doc)
-    logger.info(
-        "Chunking %s with strategy=%s (%d elements)",
-        doc.filename,
-        effective,
-        len(doc.elements),
+    # Combine all parsed elements into one continuous string.
+    # Unstructured is used only as a parser — chunking is ours.
+    full_text = "\n\n".join(el.text for el in doc.elements if el.text.strip())
+
+    if not full_text.strip():
+        return []
+
+    # Split into chunks
+    chunk_texts = recursive_character_split(
+        text=full_text,
+        chunk_size=settings.chunk_size,
+        chunk_overlap=settings.chunk_overlap,
+        separators=DEFAULT_SEPARATORS,
     )
 
-    if effective == "by_title":
-        raw = await _chunk_by_title_hybrid(doc)
-    elif effective == "by_similarity":
-        raw = await _chunk_by_similarity(doc)
-    elif effective == "naive":
-        raw = _chunk_naive(doc)
-    else:
-        logger.warning("Unknown strategy %s, falling back to by_title", effective)
-        raw = await _chunk_by_title_hybrid(doc)
+    logger.info(
+        "Chunked %s into %d chunks (avg %d chars)",
+        doc.filename,
+        len(chunk_texts),
+        sum(len(c) for c in chunk_texts) // max(len(chunk_texts), 1),
+    )
 
-    return _apply_context_headers(raw, doc)
+    # Build chunk dicts with metadata
+    all_types = list({el.element_type.value for el in doc.elements})
+    raw_chunks = [
+        {
+            "text": text,
+            "metadata": {**doc.metadata},
+            "element_types": all_types,
+        }
+        for text in chunk_texts
+        if text.strip()
+    ]
+
+    return _apply_context_headers(raw_chunks, doc)
+
+
+# ── Recursive Character Splitter ─────────────────────────────────────
+
+
+def recursive_character_split(
+    text: str,
+    chunk_size: int = 3000,
+    chunk_overlap: int = 200,
+    separators: list[str] | None = None,
+) -> list[str]:
+    """Split text into chunks using a hierarchy of separators.
+
+    Tries the highest-level separator first (paragraph breaks), falling back
+    to lower levels (line breaks, spaces, characters) when needed.
+
+    The recursive fallback handles edge cases like massive unbroken text
+    blocks (e.g., minified JSON, long URLs): if a single piece exceeds
+    chunk_size after splitting by the current separator, the function
+    recurses with the next separator in the hierarchy until it fits.
+
+    Args:
+        text: The input text to split.
+        chunk_size: Hard maximum characters per chunk (default 3000).
+        chunk_overlap: Characters of overlap between consecutive chunks (default 200).
+        separators: Ordered list of separators to try. Defaults to
+                    ["\\n\\n", "\\n", " ", ""] (paragraph → line → word → char).
+
+    Returns:
+        List of text chunks, each ≤ chunk_size characters.
+    """
+    if separators is None:
+        separators = DEFAULT_SEPARATORS
+
+    # Base case: text fits in one chunk
+    if len(text) <= chunk_size:
+        stripped = text.strip()
+        return [stripped] if stripped else []
+
+    # Find the first separator that exists in the text
+    active_sep = ""
+    remaining_seps = []
+    for i, sep in enumerate(separators):
+        if sep == "":
+            # Character-level split — always works as last resort
+            active_sep = ""
+            remaining_seps = []
+            break
+        if sep in text:
+            active_sep = sep
+            remaining_seps = separators[i + 1 :]
+            break
+
+    # Split using the active separator
+    if active_sep:
+        pieces = text.split(active_sep)
+    else:
+        # Character-by-character — split into individual chars
+        pieces = list(text)
+
+    # Accumulate pieces into chunks with overlap
+    final_chunks: list[str] = []
+    current_chunk = ""
+
+    for piece in pieces:
+        # Calculate what the chunk would be if we add this piece
+        if current_chunk:
+            candidate = current_chunk + active_sep + piece
+        else:
+            candidate = piece
+
+        if len(candidate) <= chunk_size:
+            # Fits — accumulate
+            current_chunk = candidate
+        else:
+            # Doesn't fit — finalize current chunk
+            if current_chunk:
+                final_chunks.append(current_chunk.strip())
+
+                # Calculate overlap: grab last (overlap + 50) chars, snap to word boundary
+                overlap_text = _get_overlap(current_chunk, chunk_overlap)
+            else:
+                overlap_text = ""
+
+            # Check if this single piece is itself oversized
+            if len(piece) > chunk_size:
+                # Recursive fallback: split this piece with the next separator level
+                sub_chunks = recursive_character_split(
+                    text=piece,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    separators=remaining_seps if remaining_seps else [""],
+                )
+                # Prepend overlap to the first sub-chunk if it fits
+                if sub_chunks and overlap_text:
+                    merged = overlap_text + active_sep + sub_chunks[0]
+                    if len(merged) <= chunk_size:
+                        sub_chunks[0] = merged
+                    else:
+                        # Overlap doesn't fit — just add it as context
+                        pass
+                final_chunks.extend(sub_chunks)
+                current_chunk = ""
+            else:
+                # Start new chunk with overlap + current piece
+                if overlap_text:
+                    current_chunk = overlap_text + active_sep + piece
+                    # If overlap + piece exceeds chunk_size, drop the overlap
+                    if len(current_chunk) > chunk_size:
+                        current_chunk = piece
+                else:
+                    current_chunk = piece
+
+    # Don't forget the last chunk
+    if current_chunk and current_chunk.strip():
+        final_chunks.append(current_chunk.strip())
+
+    return [c for c in final_chunks if c]
+
+
+def _get_overlap(text: str, overlap_size: int) -> str:
+    """Get the last ~overlap_size characters, snapped to a word boundary.
+
+    Grabs overlap_size + 50 characters, then finds the first space to
+    avoid cutting mid-word. Falls back to exact overlap if no space found.
+    """
+    if len(text) <= overlap_size:
+        return text
+
+    # Grab extra chars so we can snap to a word boundary
+    grab_size = min(overlap_size + 50, len(text))
+    raw = text[-grab_size:]
+
+    # Find the first space to snap to a complete word
+    space_idx = raw.find(" ")
+    if space_idx != -1 and space_idx < 50:
+        return raw[space_idx + 1 :]
+
+    # No space found in the buffer — fall back to exact overlap
+    return text[-overlap_size:]
 
 
 # ── Contextual chunk headers ─────────────────────────────────────────
@@ -94,36 +242,29 @@ def _build_header(
     parts: list[str] = []
     meta = doc.metadata
 
-    # Document title — use explicit title from metadata, fall back to filename
     title = meta.get("title") or doc.filename
     if title:
         parts.append(f"Document: {title}")
 
-    # Section hierarchy (e.g. "Kubernetes Guide > Prerequisites")
     if section:
         parts.append(f"Section: {section}")
 
-    # Source system (skip generic sources)
     source = meta.get("source", "")
     if source and source not in ("manual", "upload", ""):
         parts.append(f"Source: {source}")
 
-    # Folder / project path (from connectors)
     folder = meta.get("folder_path", "")
     if folder and folder != "/":
         parts.append(f"Path: {folder}")
 
-    # Author / owner
     author = meta.get("owner_email", "")
     if author:
         parts.append(f"Author: {author}")
 
-    # Last modified — truncate to date if ISO timestamp
     modified = meta.get("last_modified", "")
     if modified:
         parts.append(f"Modified: {modified[:10]}")
 
-    # Chunk position
     parts.append(f"Part {chunk_index + 1} of {total_chunks}")
 
     return "[" + " | ".join(parts) + "]\n"
@@ -146,293 +287,6 @@ def _extract_section(chunk_text: str, title_texts: frozenset[str]) -> str:
         if line in title_texts:
             sections.append(line)
         else:
-            break  # first non-title line — stop
+            break
 
     return " > ".join(sections)
-
-
-# ── Strategy auto-detection ───────────────────────────────────────────
-
-
-def _detect_strategy(doc: ParsedDocument) -> str:
-    """Pick strategy based on document content.
-
-    - Titles present → by_title (structure exists)
-    - No titles → by_similarity (unstructured prose)
-    - Single element → naive (nothing to split)
-    """
-    if settings.chunking_strategy != "auto":
-        return settings.chunking_strategy
-
-    if len(doc.elements) <= 1:
-        return "naive"
-
-    has_titles = any(el.element_type == ElementType.TITLE for el in doc.elements)
-    return "by_title" if has_titles else "by_similarity"
-
-
-# ── by_title hybrid: Parse Big, Store Small ──────────────────────────
-
-
-async def _chunk_by_title_hybrid(doc: ParsedDocument) -> list[dict[str, Any]]:
-    """Hybrid chunking: Unstructured groups by headings, oversized blocks go to by_similarity.
-
-    1. Unstructured's chunk_by_title groups elements under headings (limit 30K — structural only)
-    2. Each block is checked against similarity_max_characters (3000)
-    3. Small blocks → kept as-is
-    4. Oversized blocks → split semantically via by_similarity
-    """
-    import asyncio
-
-    # Step 1: Unstructured groups by headings with a large limit
-    unstructured_elements = _to_unstructured_elements(doc)
-
-    blocks = await asyncio.to_thread(
-        chunk_by_title,
-        unstructured_elements,
-        max_characters=settings.chunk_max_characters,       # 30000 — structural only
-        new_after_n_chars=settings.chunk_new_after_n_chars,  # 29000
-        overlap=0,  # we handle overlap in by_similarity, not here
-        combine_text_under_n_chars=settings.chunk_combine_under_n_chars,
-    )
-
-    max_chunk_size = settings.similarity_max_characters  # 3000 — the real ceiling
-
-    # Step 2: Check each block — keep small ones, split large ones
-    result: list[dict[str, Any]] = []
-
-    for block in blocks:
-        text = block.text.strip()
-        if not text:
-            continue
-
-        if len(text) <= max_chunk_size:
-            # Small block — keep as-is
-            result.append(
-                {
-                    "text": text,
-                    "metadata": {**doc.metadata},
-                    "element_types": [type(block).__name__],
-                }
-            )
-        else:
-            # Oversized block — split semantically
-            logger.info(
-                "Block too large (%d chars), splitting with by_similarity",
-                len(text),
-            )
-            block_elements = _text_to_elements(text)
-            block_doc = ParsedDocument(
-                filename=doc.filename,
-                filetype=doc.filetype,
-                elements=block_elements,
-                metadata=doc.metadata,
-            )
-            sub_chunks = await _chunk_by_similarity(block_doc)
-            result.extend(sub_chunks)
-
-    return result
-
-
-def _to_unstructured_elements(doc: ParsedDocument) -> list:
-    """Convert ParsedElements to Unstructured Element objects."""
-    elements = []
-    for el in doc.elements:
-        if el.element_type == ElementType.TITLE:
-            elements.append(Title(text=el.text))
-        elif el.element_type == ElementType.TABLE:
-            elements.append(Table(text=el.text))
-        elif el.element_type == ElementType.LIST_ITEM:
-            elements.append(ListItem(text=el.text))
-        else:
-            elements.append(NarrativeText(text=el.text))
-    return elements
-
-
-def _text_to_elements(text: str) -> list[ParsedElement]:
-    """Convert a block of text back into ParsedElements for by_similarity.
-
-    Splits on double-newline to recover paragraph-level elements.
-    """
-    elements: list[ParsedElement] = []
-    for para in text.split("\n\n"):
-        para = para.strip()
-        if para:
-            elements.append(
-                ParsedElement(
-                    text=para,
-                    element_type=ElementType.NARRATIVE_TEXT,
-                    metadata={},
-                )
-            )
-    return elements
-
-
-# ── by_similarity (custom, async) ────────────────────────────────────
-
-
-async def _chunk_by_similarity(doc: ParsedDocument) -> list[dict[str, Any]]:
-    """Custom semantic chunking using Nomic embeddings via Ollama.
-
-    1. Embed all elements in one batch
-    2. Compute cosine similarity between consecutive embeddings
-    3. Cut where similarity < threshold
-    4. Group into chunks, split if exceeding similarity_max_characters
-    """
-    from backend.embedding.embedder import embed_batch
-
-    element_texts = [el.text for el in doc.elements]
-
-    # Single element — just return it
-    if len(element_texts) <= 1:
-        text = element_texts[0] if element_texts else ""
-        if not text:
-            return []
-        return [
-            {
-                "text": text,
-                "metadata": {**doc.metadata},
-                "element_types": [doc.elements[0].element_type.value],
-            }
-        ]
-
-    embeddings = await embed_batch(element_texts)
-
-    # Consecutive cosine similarities
-    similarities: list[float] = []
-    for i in range(len(embeddings) - 1):
-        similarities.append(_cosine_similarity(embeddings[i], embeddings[i + 1]))
-
-    # Cut points where similarity drops below threshold
-    cut_indices: list[int] = []
-    for i, sim in enumerate(similarities):
-        if sim < settings.similarity_threshold:
-            cut_indices.append(i + 1)
-
-    # Group elements into segments with overlap.
-    overlap_chars = settings.chunk_overlap
-    segments: list[list[int]] = []
-    start = 0
-    for cut in cut_indices:
-        segments.append(list(range(start, cut)))
-        # Walk backwards from the cut to find overlap elements
-        overlap_start = cut
-        char_count = 0
-        for j in range(cut - 1, start - 1, -1):
-            char_count += len(doc.elements[j].text)
-            if char_count >= overlap_chars:
-                overlap_start = j
-                break
-        start = min(overlap_start, cut)
-    segments.append(list(range(start, len(doc.elements))))
-
-    # Convert segments to chunks
-    result: list[dict[str, Any]] = []
-    for segment_indices in segments:
-        if not segment_indices:
-            continue
-
-        segment_elements = [doc.elements[i] for i in segment_indices]
-        segment_text = "\n\n".join(el.text for el in segment_elements)
-        segment_types = list({el.element_type.value for el in segment_elements})
-
-        if len(segment_text) <= settings.similarity_max_characters:
-            result.append(
-                {
-                    "text": segment_text,
-                    "metadata": {**doc.metadata},
-                    "element_types": segment_types,
-                }
-            )
-        else:
-            result.extend(
-                _split_segment_by_size(
-                    segment_elements,
-                    doc.metadata,
-                    settings.similarity_max_characters,
-                )
-            )
-
-    return result
-
-
-# ── naive (fallback) ─────────────────────────────────────────────────
-
-
-def _chunk_naive(doc: ParsedDocument) -> list[dict[str, Any]]:
-    """Simple character-based splitting for single-element docs."""
-    full_text = "\n\n".join(el.text for el in doc.elements)
-    size = settings.similarity_max_characters
-    overlap = settings.chunk_overlap
-
-    paragraphs = [p.strip() for p in full_text.split("\n\n") if p.strip()]
-    chunks: list[str] = []
-    current = ""
-
-    for para in paragraphs:
-        if current and len(current) + len(para) + 2 > size:
-            chunks.append(current)
-            current = current[-overlap:] + "\n\n" + para if overlap else para
-        else:
-            current = current + "\n\n" + para if current else para
-    if current:
-        chunks.append(current)
-
-    all_types = list({el.element_type.value for el in doc.elements})
-    return [
-        {"text": c, "metadata": {**doc.metadata}, "element_types": all_types}
-        for c in chunks
-        if c.strip()
-    ]
-
-
-# ── Helpers ───────────────────────────────────────────────────────────
-
-
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
-
-
-def _split_segment_by_size(
-    elements: list[ParsedElement],
-    doc_metadata: dict[str, Any],
-    max_chars: int,
-) -> list[dict[str, Any]]:
-    """Split a list of elements into chunks that fit within max_chars."""
-    result: list[dict[str, Any]] = []
-    current_texts: list[str] = []
-    current_types: set[str] = set()
-    current_len = 0
-
-    for el in elements:
-        addition = len(el.text) + (2 if current_texts else 0)
-        if current_len + addition > max_chars and current_texts:
-            result.append(
-                {
-                    "text": "\n\n".join(current_texts),
-                    "metadata": {**doc_metadata},
-                    "element_types": list(current_types),
-                }
-            )
-            current_texts = []
-            current_types = set()
-            current_len = 0
-
-        current_texts.append(el.text)
-        current_types.add(el.element_type.value)
-        current_len += addition
-
-    if current_texts:
-        result.append(
-            {
-                "text": "\n\n".join(current_texts),
-                "metadata": {**doc_metadata},
-                "element_types": list(current_types),
-            }
-        )
-    return result
