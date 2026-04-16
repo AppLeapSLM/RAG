@@ -43,7 +43,7 @@
     overflow: hidden;
   }
 
-  /* ── Sidebar (upload) ───────────────────────── */
+  /* ── Sidebar ────────────────────────────────── */
   .sidebar {
     width: 320px;
     background: #fff;
@@ -52,6 +52,107 @@
     flex-direction: column;
     flex-shrink: 0;
   }
+
+  .sidebar-tabs {
+    display: flex;
+    border-bottom: 1px solid #e0e0e0;
+    flex-shrink: 0;
+  }
+  .sidebar-tabs button {
+    flex: 1;
+    padding: 12px 0;
+    border: none;
+    background: #f9f9f9;
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #888;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: all 0.2s;
+  }
+  .sidebar-tabs button.active {
+    background: #fff;
+    color: #111;
+    border-bottom-color: #111;
+  }
+
+  .sidebar-panel {
+    display: none;
+    flex: 1;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .sidebar-panel.active {
+    display: flex;
+  }
+
+  /* ── Chats panel ────────────────────────────── */
+  .new-chat-btn {
+    margin: 12px 16px;
+    padding: 10px 16px;
+    background: #111;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.2s;
+    flex-shrink: 0;
+  }
+  .new-chat-btn:hover { background: #333; }
+
+  .chat-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 4px 16px;
+  }
+
+  .chat-item {
+    padding: 12px;
+    margin-bottom: 4px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.15s;
+    position: relative;
+  }
+  .chat-item:hover { background: #f5f5f5; }
+  .chat-item.active { background: #eee; }
+  .chat-item .chat-title {
+    font-size: 14px;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding-right: 28px;
+  }
+  .chat-item .chat-time {
+    font-size: 11px;
+    color: #888;
+    margin-top: 2px;
+  }
+  .chat-item .chat-delete {
+    position: absolute;
+    top: 10px;
+    right: 8px;
+    width: 24px;
+    height: 24px;
+    border: none;
+    background: none;
+    color: #bbb;
+    font-size: 16px;
+    cursor: pointer;
+    border-radius: 4px;
+    display: none;
+    align-items: center;
+    justify-content: center;
+  }
+  .chat-item:hover .chat-delete { display: flex; }
+  .chat-item .chat-delete:hover { background: #e0e0e0; color: #ef4444; }
+
+  /* ── Upload panel ───────────────────────────── */
   .sidebar h2 {
     font-size: 14px;
     font-weight: 600;
@@ -235,17 +336,31 @@
 </header>
 
 <div class="container">
-  <!-- Sidebar: file upload -->
+  <!-- Sidebar -->
   <div class="sidebar">
-    <h2>Upload Documents</h2>
-    <div class="drop-zone" id="drop-zone">
-      <p>Drop files here or click to browse</p>
-      <p style="margin-top:6px;font-size:12px;">PDF, DOCX, PPTX, Markdown, HTML, TXT, CSV, JSON, XML</p>
-      <input type="file" id="file-input" multiple
-        accept=".pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.md,.txt,.html,.htm,.rst,.csv,.json,.xml">
+    <div class="sidebar-tabs">
+      <button class="active" data-tab="chats">Chats</button>
+      <button data-tab="upload">Upload</button>
     </div>
-    <h2>Uploaded Files</h2>
-    <div class="file-list" id="file-list"></div>
+
+    <!-- Chats panel -->
+    <div class="sidebar-panel active" id="panel-chats">
+      <button class="new-chat-btn" id="new-chat-btn">+ New Chat</button>
+      <div class="chat-list" id="chat-list"></div>
+    </div>
+
+    <!-- Upload panel -->
+    <div class="sidebar-panel" id="panel-upload">
+      <h2>Upload Documents</h2>
+      <div class="drop-zone" id="drop-zone">
+        <p>Drop files here or click to browse</p>
+        <p style="margin-top:6px;font-size:12px;">PDF, DOCX, PPTX, Markdown, HTML, TXT, CSV, JSON, XML</p>
+        <input type="file" id="file-input" multiple
+          accept=".pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.md,.txt,.html,.htm,.rst,.csv,.json,.xml">
+      </div>
+      <h2>Uploaded Files</h2>
+      <div class="file-list" id="file-list"></div>
+    </div>
   </div>
 
   <!-- Chat -->
@@ -253,7 +368,7 @@
     <div class="messages" id="messages">
       <div class="message assistant">
         <div class="role">AppLeap</div>
-        <div class="bubble">Upload some documents using the panel on the left, then ask me anything about them.</div>
+        <div class="bubble">Upload some documents using the Upload tab, then ask me anything about them.</div>
       </div>
     </div>
     <div class="thinking" id="thinking">Thinking...</div>
@@ -267,7 +382,20 @@
 <script>
 const API = window.location.origin;
 
-// ── Health check ──────────────────────────────
+// ── State ────────────────────────────────────
+let currentConversationId = null;
+
+// ── Sidebar tabs ─────────────────────────────
+document.querySelectorAll(".sidebar-tabs button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".sidebar-tabs button").forEach(b => b.classList.remove("active"));
+    document.querySelectorAll(".sidebar-panel").forEach(p => p.classList.remove("active"));
+    btn.classList.add("active");
+    document.getElementById(`panel-${btn.dataset.tab}`).classList.add("active");
+  });
+});
+
+// ── Health check ─────────────────────────────
 async function checkHealth() {
   const dot = document.getElementById("health-dot");
   try {
@@ -282,7 +410,114 @@ async function checkHealth() {
 checkHealth();
 setInterval(checkHealth, 30000);
 
-// ── File upload ───────────────────────────────
+// ── Conversation management ──────────────────
+
+async function loadConversations() {
+  const list = document.getElementById("chat-list");
+  try {
+    const r = await fetch(`${API}/conversations`);
+    if (!r.ok) return;
+    const conversations = await r.json();
+
+    list.innerHTML = "";
+    for (const conv of conversations) {
+      const item = document.createElement("div");
+      item.className = `chat-item${conv.id === currentConversationId ? " active" : ""}`;
+      item.dataset.id = conv.id;
+
+      const time = new Date(conv.updated_at);
+      const timeStr = formatTime(time);
+
+      item.innerHTML = `
+        <div class="chat-title" title="${escapeHtml(conv.title)}">${escapeHtml(conv.title)}</div>
+        <div class="chat-time">${timeStr} &middot; ${conv.message_count} messages</div>
+        <button class="chat-delete" title="Delete">&times;</button>
+      `;
+
+      item.addEventListener("click", (e) => {
+        if (e.target.closest(".chat-delete")) return;
+        openConversation(conv.id);
+      });
+
+      item.querySelector(".chat-delete").addEventListener("click", async (e) => {
+        e.stopPropagation();
+        if (!confirm("Delete this conversation?")) return;
+        await fetch(`${API}/conversations/${conv.id}`, { method: "DELETE" });
+        if (currentConversationId === conv.id) {
+          startNewChat();
+        }
+        loadConversations();
+      });
+
+      list.appendChild(item);
+    }
+  } catch (e) {
+    console.error("Failed to load conversations:", e);
+  }
+}
+
+async function openConversation(convId) {
+  try {
+    const r = await fetch(`${API}/conversations/${convId}`);
+    if (!r.ok) return;
+    const conv = await r.json();
+
+    currentConversationId = convId;
+    const messagesEl = document.getElementById("messages");
+    messagesEl.innerHTML = "";
+
+    for (const msg of conv.messages) {
+      appendMessage(msg.role, msg.content, msg.sources);
+    }
+
+    if (conv.messages.length === 0) {
+      appendMessage("assistant", "Upload some documents using the Upload tab, then ask me anything about them.");
+    }
+
+    // Highlight active chat in sidebar
+    document.querySelectorAll(".chat-item").forEach(item => {
+      item.classList.toggle("active", item.dataset.id === convId);
+    });
+
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  } catch (e) {
+    console.error("Failed to open conversation:", e);
+  }
+}
+
+function startNewChat() {
+  currentConversationId = null;
+  const messagesEl = document.getElementById("messages");
+  messagesEl.innerHTML = `
+    <div class="message assistant">
+      <div class="role">AppLeap</div>
+      <div class="bubble">Upload some documents using the Upload tab, then ask me anything about them.</div>
+    </div>
+  `;
+  document.querySelectorAll(".chat-item").forEach(item => item.classList.remove("active"));
+  document.getElementById("query-input").focus();
+}
+
+document.getElementById("new-chat-btn").addEventListener("click", startNewChat);
+
+function formatTime(date) {
+  const now = new Date();
+  const diffMs = now - date;
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMs / 3600000);
+  const diffDays = Math.floor(diffMs / 86400000);
+
+  if (diffMins < 1) return "Just now";
+  if (diffMins < 60) return `${diffMins}m ago`;
+  if (diffHours < 24) return `${diffHours}h ago`;
+  if (diffDays < 7) return `${diffDays}d ago`;
+  return date.toLocaleDateString();
+}
+
+// Load conversations on page load
+loadConversations();
+
+// ── File upload ──────────────────────────────
 const dropZone = document.getElementById("drop-zone");
 const fileInput = document.getElementById("file-input");
 const fileList = document.getElementById("file-list");
@@ -338,7 +573,7 @@ async function uploadFile(file) {
   }
 }
 
-// ── Chat ──────────────────────────────────────
+// ── Chat ─────────────────────────────────────
 const messagesEl = document.getElementById("messages");
 const queryInput = document.getElementById("query-input");
 const sendBtn = document.getElementById("send-btn");
@@ -360,10 +595,15 @@ async function sendQuery() {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 
   try {
+    const body = { question };
+    if (currentConversationId) {
+      body.conversation_id = currentConversationId;
+    }
+
     const r = await fetch(`${API}/query`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question }),
+      body: JSON.stringify(body),
     });
 
     if (!r.ok) {
@@ -373,6 +613,13 @@ async function sendQuery() {
     }
 
     const data = await r.json();
+
+    // Track the conversation ID (auto-created on first query)
+    if (data.conversation_id) {
+      currentConversationId = data.conversation_id;
+      loadConversations();
+    }
+
     appendMessage("assistant", data.answer, data.sources);
   } catch (e) {
     appendMessage("assistant", `Network error: ${e.message}`);

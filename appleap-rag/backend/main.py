@@ -23,9 +23,9 @@ try:
 except ImportError:
     _GDRIVE_AVAILABLE = False
 from backend.db.connection import async_session, engine, get_session
-from backend.db.models import Base, Chunk, Document
+from backend.db.models import Base, Chunk, Conversation, Document, Message
 from backend.embedding.embedder import embed_batch
-from backend.generation.llm import generate_answer
+from backend.generation.llm import generate_answer, rewrite_query
 from backend.parsing.parser import parse_file, parse_text
 from backend.retrieval.vector_search import search
 
@@ -105,11 +105,33 @@ class IngestResponse(BaseModel):
 class QueryRequest(BaseModel):
     question: str
     top_k: int = settings.top_k
+    conversation_id: str | None = None
 
 
 class QueryResponse(BaseModel):
     answer: str
     sources: list[dict]
+    conversation_id: str
+
+
+class ConversationSummary(BaseModel):
+    id: str
+    title: str
+    created_at: str
+    updated_at: str
+    message_count: int
+
+
+class ConversationDetail(BaseModel):
+    id: str
+    title: str
+    created_at: str
+    updated_at: str
+    messages: list[dict]
+
+
+class ConversationUpdate(BaseModel):
+    title: str
 
 
 ALLOWED_EXTENSIONS = {
@@ -256,14 +278,44 @@ async def ingest_file(
 
 @app.post("/query", response_model=QueryResponse)
 async def query(req: QueryRequest, session: AsyncSession = Depends(get_session)):
-    """Answer a question using retrieved context from pgvector + Phi-4."""
-    # 1. Retrieve relevant chunks (with neighbor expansion)
-    results = await search(req.question, session, top_k=req.top_k)
+    """Answer a question using retrieved context, with conversation memory.
 
-    # 2. Generate answer from context (or general knowledge if no results)
-    answer = await generate_answer(req.question, results)
+    If conversation_id is provided, loads history for query rewriting and
+    context-aware generation. If omitted, auto-creates a new conversation.
+    """
+    from sqlalchemy import select as sa_select
 
-    # 3. Return answer + source metadata
+    # 1. Resolve or create conversation
+    if req.conversation_id:
+        conv = await session.get(Conversation, req.conversation_id)
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+    else:
+        conv = Conversation(title="New Chat")
+        session.add(conv)
+        await session.flush()
+
+    # 2. Load conversation history (all messages, chronological)
+    rows = (
+        await session.execute(
+            sa_select(Message)
+            .where(Message.conversation_id == conv.id)
+            .order_by(Message.created_at)
+        )
+    ).scalars().all()
+
+    history = [{"role": m.role, "content": m.content} for m in rows]
+
+    # 3. Rewrite query using history (resolves pronouns, references)
+    search_query = await rewrite_query(req.question, history)
+
+    # 4. Retrieve relevant chunks using the rewritten query
+    results = await search(search_query, session, top_k=req.top_k)
+
+    # 5. Generate answer with full conversation history
+    answer = await generate_answer(req.question, results, history=history)
+
+    # 6. Build source metadata
     sources = [
         {
             "chunk_id": r.id,
@@ -273,7 +325,158 @@ async def query(req: QueryRequest, session: AsyncSession = Depends(get_session))
         }
         for r in results
     ]
-    return QueryResponse(answer=answer, sources=sources)
+
+    # 7. Store user message
+    user_msg = Message(
+        conversation_id=conv.id,
+        role="user",
+        content=req.question,
+    )
+    session.add(user_msg)
+
+    # 8. Store assistant message with retrieval metadata
+    assistant_msg = Message(
+        conversation_id=conv.id,
+        role="assistant",
+        content=answer,
+        model_used=settings.llm_model,
+        sources=sources,
+        metadata_={"rewritten_query": search_query} if search_query != req.question else {},
+    )
+    session.add(assistant_msg)
+
+    # 9. Auto-title conversation from first user question
+    if conv.title == "New Chat":
+        conv.title = req.question[:100]
+
+    # 10. Update conversation timestamp
+    conv.updated_at = datetime.now(timezone.utc)
+
+    await session.commit()
+
+    return QueryResponse(
+        answer=answer,
+        sources=sources,
+        conversation_id=conv.id,
+    )
+
+
+# ── Conversation endpoints ─────────────────────────────────────────
+
+
+@app.get("/conversations", response_model=list[ConversationSummary])
+async def list_conversations(session: AsyncSession = Depends(get_session)):
+    """List all conversations, most recent first."""
+    from sqlalchemy import func, select as sa_select
+
+    # Subquery: message count per conversation
+    msg_count = (
+        sa_select(
+            Message.conversation_id,
+            func.count(Message.id).label("msg_count"),
+        )
+        .group_by(Message.conversation_id)
+        .subquery()
+    )
+
+    rows = (
+        await session.execute(
+            sa_select(Conversation, msg_count.c.msg_count)
+            .outerjoin(msg_count, Conversation.id == msg_count.c.conversation_id)
+            .order_by(Conversation.updated_at.desc())
+        )
+    ).all()
+
+    return [
+        ConversationSummary(
+            id=conv.id,
+            title=conv.title,
+            created_at=conv.created_at.isoformat(),
+            updated_at=conv.updated_at.isoformat(),
+            message_count=count or 0,
+        )
+        for conv, count in rows
+    ]
+
+
+@app.get("/conversations/{conversation_id}", response_model=ConversationDetail)
+async def get_conversation(
+    conversation_id: str,
+    session: AsyncSession = Depends(get_session),
+):
+    """Load a full conversation with all messages."""
+    from sqlalchemy import select as sa_select
+
+    conv = await session.get(Conversation, conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    rows = (
+        await session.execute(
+            sa_select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at)
+        )
+    ).scalars().all()
+
+    messages = [
+        {
+            "id": m.id,
+            "role": m.role,
+            "content": m.content,
+            "model_used": m.model_used,
+            "sources": m.sources,
+            "created_at": m.created_at.isoformat(),
+        }
+        for m in rows
+    ]
+
+    return ConversationDetail(
+        id=conv.id,
+        title=conv.title,
+        created_at=conv.created_at.isoformat(),
+        updated_at=conv.updated_at.isoformat(),
+        messages=messages,
+    )
+
+
+@app.patch("/conversations/{conversation_id}")
+async def update_conversation(
+    conversation_id: str,
+    req: ConversationUpdate,
+    session: AsyncSession = Depends(get_session),
+):
+    """Rename a conversation."""
+    conv = await session.get(Conversation, conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    conv.title = req.title
+    conv.updated_at = datetime.now(timezone.utc)
+    await session.commit()
+    return {"id": conv.id, "title": conv.title}
+
+
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: str,
+    session: AsyncSession = Depends(get_session),
+):
+    """Delete a conversation and all its messages."""
+    from sqlalchemy import delete as sa_delete
+
+    conv = await session.get(Conversation, conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    await session.execute(
+        sa_delete(Message).where(Message.conversation_id == conversation_id)
+    )
+    await session.execute(
+        sa_delete(Conversation).where(Conversation.id == conversation_id)
+    )
+    await session.commit()
+    return {"deleted": conversation_id}
 
 
 # ── Google Drive connector ─────────────────────────────────────────
