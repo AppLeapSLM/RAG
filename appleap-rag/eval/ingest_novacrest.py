@@ -11,6 +11,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 
@@ -21,6 +22,9 @@ SUPPORTED_EXTENSIONS = {
 
 # .tf.json files need special handling (extension is .json but path contains .tf.json)
 SKIP_DIRS = {"__pycache__", ".git", "node_modules"}
+
+MAX_RETRIES = 3
+RETRY_BACKOFF = [5, 15, 30]  # seconds to wait before each retry
 
 
 def find_files(data_dir: Path) -> list[Path]:
@@ -38,10 +42,30 @@ def find_files(data_dir: Path) -> list[Path]:
     return files
 
 
+def unload_llm(ollama_url: str) -> None:
+    """Unload the LLM (phi4) from Ollama to free VRAM for embedding.
+
+    Uses the Ollama generate API with keep_alive=0 to immediately unload.
+    The model will auto-reload on the next query request.
+    """
+    print("Unloading LLM (phi4) to free VRAM for embedding...")
+    try:
+        with httpx.Client() as client:
+            response = client.post(
+                f"{ollama_url}/api/generate",
+                json={"model": "phi4", "keep_alive": 0},
+                timeout=30.0,
+            )
+            if response.status_code == 200:
+                print("  phi4 unloaded successfully.\n")
+            else:
+                print(f"  Warning: phi4 unload returned {response.status_code} (may not be loaded).\n")
+    except Exception as e:
+        print(f"  Warning: Could not unload phi4: {e} (continuing anyway).\n")
+
+
 def ingest_file_via_api(client: httpx.Client, api_url: str, filepath: Path) -> dict:
     """Ingest a single file via POST /ingest/file."""
-    # Determine the relative category from directory structure
-    rel = filepath.relative_to(filepath.parents[1]) if len(filepath.parts) > 2 else filepath
     category = filepath.parent.name
 
     with open(filepath, "rb") as f:
@@ -80,6 +104,15 @@ def ingest_text_via_api(client: httpx.Client, api_url: str, filepath: Path) -> d
         return {"error": response.status_code, "detail": response.text}
 
 
+def ingest_one(client: httpx.Client, api_url: str, filepath: Path, file_api_extensions: set) -> dict:
+    """Ingest a single file, choosing the right API based on extension."""
+    ext = filepath.suffix.lower()
+    if ext in file_api_extensions:
+        return ingest_file_via_api(client, api_url, filepath)
+    else:
+        return ingest_text_via_api(client, api_url, filepath)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Ingest NovaCrest data into AppLeap RAG")
     parser.add_argument(
@@ -92,13 +125,17 @@ def main():
         default=None,
         help="Path to the NovaCrest synthetic data directory",
     )
+    parser.add_argument(
+        "--ollama-url",
+        default=None,
+        help="Ollama API URL (default: derived from api-url host, port 11434)",
+    )
     args = parser.parse_args()
 
     # Resolve data directory
     if args.data_dir:
         data_dir = Path(args.data_dir)
     else:
-        # Default: look for the NovaCrest data relative to common locations
         candidates = [
             Path(__file__).resolve().parent.parent.parent
             / "AppLeapv3" / "appleap" / "synthetic_data" / "output" / "novacrest",
@@ -132,28 +169,35 @@ def main():
         print(f"ERROR: Cannot reach API at {args.api_url}: {e}")
         sys.exit(1)
 
+    # Derive Ollama URL from API URL (same host, port 11434)
+    if args.ollama_url:
+        ollama_url = args.ollama_url
+    else:
+        parsed = urlparse(args.api_url)
+        ollama_url = f"{parsed.scheme}://{parsed.hostname}:11434"
+
+    # Unload LLM to free VRAM for embedding
+    unload_llm(ollama_url)
+
     # File extensions supported by /ingest/file (via Unstructured)
     file_api_extensions = {".md", ".txt", ".html", ".htm", ".csv", ".json", ".xml"}
 
     ingested = 0
-    failed = 0
+    failed_files = []  # (index, filepath) for retry
     total_chunks = 0
     start = time.time()
 
+    # ── First pass ─────────────────────────────────────────────────
     for i, filepath in enumerate(files, 1):
-        ext = filepath.suffix.lower()
         category = filepath.parent.name
         print(f"[{i}/{len(files)}] {category}/{filepath.name}", end=" ... ", flush=True)
 
         try:
-            if ext in file_api_extensions:
-                result = ingest_file_via_api(client, args.api_url, filepath)
-            else:
-                result = ingest_text_via_api(client, args.api_url, filepath)
+            result = ingest_one(client, args.api_url, filepath, file_api_extensions)
 
             if "error" in result:
                 print(f"FAILED ({result.get('detail', 'unknown')[:80]})")
-                failed += 1
+                failed_files.append((i, filepath))
             else:
                 chunks = result.get("chunks_stored", 0)
                 total_chunks += chunks
@@ -162,14 +206,58 @@ def main():
 
         except Exception as e:
             print(f"ERROR: {e}")
-            failed += 1
+            failed_files.append((i, filepath))
+
+    # ── Retry failed files ─────────────────────────────────────────
+    if failed_files:
+        for attempt in range(MAX_RETRIES):
+            if not failed_files:
+                break
+
+            wait = RETRY_BACKOFF[attempt]
+            print(f"\n--- Retry {attempt + 1}/{MAX_RETRIES}: {len(failed_files)} files, waiting {wait}s ---")
+            time.sleep(wait)
+
+            # Unload LLM again in case it got reloaded
+            unload_llm(ollama_url)
+
+            still_failed = []
+            for orig_idx, filepath in failed_files:
+                category = filepath.parent.name
+                print(f"  [retry {attempt + 1}] {category}/{filepath.name}", end=" ... ", flush=True)
+
+                try:
+                    result = ingest_one(client, args.api_url, filepath, file_api_extensions)
+
+                    if "error" in result:
+                        print(f"FAILED ({result.get('detail', 'unknown')[:80]})")
+                        still_failed.append((orig_idx, filepath))
+                    else:
+                        chunks = result.get("chunks_stored", 0)
+                        total_chunks += chunks
+                        print(f"OK ({chunks} chunks)")
+                        ingested += 1
+
+                except Exception as e:
+                    print(f"ERROR: {e}")
+                    still_failed.append((orig_idx, filepath))
+
+            failed_files = still_failed
 
     elapsed = time.time() - start
+    final_failed = len(failed_files)
+
     print(f"\n{'=' * 60}")
     print(f"Ingestion complete in {elapsed:.1f}s")
     print(f"  Ingested: {ingested}/{len(files)} files")
-    print(f"  Failed:   {failed}/{len(files)} files")
+    print(f"  Failed:   {final_failed}/{len(files)} files (after {MAX_RETRIES} retries)")
     print(f"  Chunks:   {total_chunks} total")
+
+    if failed_files:
+        print(f"\n  Permanently failed files:")
+        for _, fp in failed_files:
+            print(f"    {fp.parent.name}/{fp.name}")
+
     print(f"{'=' * 60}")
 
 
