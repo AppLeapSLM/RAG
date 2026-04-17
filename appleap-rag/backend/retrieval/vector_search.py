@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from sqlalchemy import select
@@ -9,17 +10,17 @@ from backend.config import settings
 from backend.db.models import Chunk
 from backend.embedding.embedder import embed_text
 from backend.retrieval.keyword_search import keyword_search
+from backend.retrieval.reranker import rerank
 
 logger = logging.getLogger(__name__)
 
-# RRF constant — standard value from the original paper
-RRF_K = 60
-
-# Each retriever over-fetches this many candidates before RRF fusion.
-# A wider candidate pool means the correct chunk has more chances to be
-# surfaced by at least one retriever, even if its raw rank is modest in
-# either individual system. Downstream we still return `top_k` to the caller.
-RETRIEVER_OVERFETCH = 30
+# Asymmetric over-fetch — calibrated to retrieval_diagnostic.py observations:
+#   - Vector retrieval hits in the top ~10 or not at all; going wider is
+#     wasted compute for the reranker.
+#   - Keyword retrieval has slower decay — correct chunks have been observed
+#     at ranks 38 and 45 — so we need a wider keyword net.
+VECTOR_OVERFETCH = 15
+KEYWORD_OVERFETCH = 50
 
 
 async def search(
@@ -28,33 +29,43 @@ async def search(
     top_k: int = settings.top_k,
     neighbor_window: int = settings.neighbor_window,
 ) -> list[Chunk]:
-    """Hybrid search: vector similarity + BM25 keyword search, fused with RRF.
+    """Hybrid search: vector + keyword → union → cross-encoder rerank → top_k.
 
-    1. Vector search → RETRIEVER_OVERFETCH closest chunks by cosine distance
-    2. Keyword search → RETRIEVER_OVERFETCH best BM25 matches
-    3. Reciprocal Rank Fusion to combine both result sets → top_k
-    4. Optional neighbor expansion (±neighbor_window)
-    5. Return top_k final results sorted by (document_id, chunk_index)
+    1. Vector search → top VECTOR_OVERFETCH by cosine distance
+    2. Keyword search → top KEYWORD_OVERFETCH by ts_rank_cd
+       (both retrievers run in parallel)
+    3. Union and dedupe by chunk_id — retrieval = coverage
+    4. Cross-encoder rerank all candidates → top_k — reranker = precision
+    5. Optional neighbor expansion (±neighbor_window)
+    6. Final results sorted by (document_id, chunk_index) for reading order
+
+    No RRF: a cross-encoder overrides whatever order RRF produces, so RRF
+    becomes dead weight. See CLAUDE.md V8 Phase 2.
     """
-    # Each retriever over-fetches — the final RRF narrows to top_k.
-    pool_size = max(top_k, RETRIEVER_OVERFETCH)
-    vector_results = await _vector_search(query, session, top_k=pool_size)
-    kw_results = await keyword_search(query, session, top_k=pool_size)
+    vector_task = _vector_search(query, session, top_k=VECTOR_OVERFETCH)
+    keyword_task = keyword_search(query, session, top_k=KEYWORD_OVERFETCH)
+    vector_results, keyword_results = await asyncio.gather(vector_task, keyword_task)
+
+    # Union + dedupe by chunk_id. First occurrence wins; order doesn't matter
+    # because the reranker re-scores everything.
+    pool: dict[str, Chunk] = {}
+    for c in vector_results:
+        pool.setdefault(c.id, c)
+    for c in keyword_results:
+        pool.setdefault(c.id, c)
+    candidates = list(pool.values())
 
     logger.info(
-        "Hybrid search: %d vector hits, %d keyword hits",
-        len(vector_results),
-        len(kw_results),
+        "Hybrid pool: %d vector + %d keyword = %d unique candidates",
+        len(vector_results), len(keyword_results), len(candidates),
     )
 
-    # Fuse with RRF
-    fused = _reciprocal_rank_fusion(vector_results, kw_results, top_k=top_k)
+    reranked = await rerank(query, candidates, top_k=top_k)
 
-    # Optional neighbor expansion
-    if fused and neighbor_window > 0:
-        fused = await _expand_neighbors(fused, session, neighbor_window)
+    if reranked and neighbor_window > 0:
+        reranked = await _expand_neighbors(reranked, session, neighbor_window)
 
-    return fused
+    return reranked
 
 
 async def _vector_search(
@@ -72,37 +83,6 @@ async def _vector_search(
     )
     result = await session.execute(stmt)
     return list(result.scalars().all())
-
-
-def _reciprocal_rank_fusion(
-    vector_results: list[Chunk],
-    keyword_results: list[Chunk],
-    top_k: int,
-) -> list[Chunk]:
-    """Combine two ranked lists using Reciprocal Rank Fusion.
-
-    RRF score = sum of 1/(k + rank) across all lists where the item appears.
-    Higher score = appeared in both lists or ranked highly in one.
-    """
-    scores: dict[str, float] = {}
-    chunk_map: dict[str, Chunk] = {}
-
-    for rank, chunk in enumerate(vector_results):
-        scores[chunk.id] = scores.get(chunk.id, 0) + 1 / (RRF_K + rank + 1)
-        chunk_map[chunk.id] = chunk
-
-    for rank, chunk in enumerate(keyword_results):
-        scores[chunk.id] = scores.get(chunk.id, 0) + 1 / (RRF_K + rank + 1)
-        chunk_map[chunk.id] = chunk
-
-    # Sort by RRF score descending, take top_k
-    ranked_ids = sorted(scores, key=lambda cid: scores[cid], reverse=True)[:top_k]
-
-    # Sort final results by (document_id, chunk_index) for reading order
-    results = [chunk_map[cid] for cid in ranked_ids]
-    results.sort(key=lambda c: (c.document_id, c.chunk_index))
-
-    return results
 
 
 async def _expand_neighbors(
