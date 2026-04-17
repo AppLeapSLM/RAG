@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.chunking.chunker import chunk_parsed_document_async
+from backend.chunking.dispatch import process_file
 from backend.config import settings
 from backend.connectors.base import SyncResult, SyncStatus
 
@@ -26,7 +27,7 @@ from backend.db.connection import async_session, engine, get_session
 from backend.db.models import Base, Chunk, Conversation, Document, Message
 from backend.embedding.embedder import embed_batch
 from backend.generation.llm import generate_answer, rewrite_query
-from backend.parsing.parser import parse_file, parse_text
+from backend.parsing.parser import parse_text
 from backend.retrieval.vector_search import search
 
 logger = logging.getLogger(__name__)
@@ -135,8 +136,17 @@ class ConversationUpdate(BaseModel):
 
 
 ALLOWED_EXTENSIONS = {
+    # Prose / office (via Unstructured.io)
     ".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls",
-    ".md", ".txt", ".html", ".htm", ".rst", ".csv", ".json", ".xml",
+    ".md", ".markdown", ".txt", ".html", ".htm", ".rst", ".xml",
+    ".eml", ".rtf",
+    # Tabular
+    ".csv",
+    # IaC / config (via tree-sitter)
+    ".tf", ".tfvars", ".hcl", ".yaml", ".yml", ".json", ".pp",
+    # Code (via tree-sitter)
+    ".py", ".pyi", ".go", ".rb", ".js", ".mjs", ".cjs", ".jsx",
+    ".ts", ".tsx", ".sh", ".bash",
 }
 
 
@@ -217,42 +227,40 @@ async def ingest_file(
             detail=f"File too large. Max: {settings.max_upload_size_mb}MB",
         )
 
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=ext)
+    # .tf.json needs a two-segment suffix so tempfile preserves it for classification
+    suffix = ".tf.json" if file.filename.lower().endswith(".tf.json") else ext
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
     try:
         os.write(tmp_fd, content)
         os.close(tmp_fd)
 
-        # 3. Parse with Unstructured (sync, run in thread)
-        parsed_doc = await asyncio.to_thread(
-            parse_file, tmp_path, {**extra_metadata, "title": file.filename}
+        # 3. Parse + chunk via dispatch (routes prose → Unstructured, structured → tree-sitter)
+        meta_in = {**extra_metadata, "title": file.filename, "source": source}
+        chunks, doc_meta = await process_file(
+            tmp_path, meta_in, display_name=file.filename
         )
-
-        # 4. Chunk (async — by_similarity needs embeddings)
-        chunks = await chunk_parsed_document_async(parsed_doc)
         if not chunks:
             raise HTTPException(
                 status_code=400, detail="No content extracted from file"
             )
 
-        # 5. Create document record
+        # 4. Create document record
         doc = Document(
             source=source,
             title=file.filename,
             metadata_={
                 **extra_metadata,
-                "filetype": parsed_doc.filetype,
-                "original_filename": parsed_doc.filename,
-                "num_elements": len(parsed_doc.elements),
+                **doc_meta,
             },
         )
         session.add(doc)
         await session.flush()
 
-        # 6. Embed all chunk texts in one batch
+        # 5. Embed all chunk texts in one batch
         chunk_texts = [c["text"] for c in chunks]
         embeddings = await embed_batch(chunk_texts)
 
-        # 7. Store chunks with embeddings
+        # 6. Store chunks with embeddings
         for i, (chunk_data, emb) in enumerate(zip(chunks, embeddings)):
             chunk = Chunk(
                 document_id=doc.id,
@@ -494,18 +502,17 @@ async def _ingest_connector_file(
 
     Returns the number of chunks stored.
     """
-    parsed_doc = await asyncio.to_thread(
-        parse_file,
+    meta_in = {
+        **connector_file.metadata,
+        "title": connector_file.filename,
+        "source": connector_file.source,
+        "permissions": connector_file.permissions,
+    }
+    chunks, doc_meta = await process_file(
         connector_file.file_path,
-        {
-            **connector_file.metadata,
-            "title": connector_file.filename,
-            "source": connector_file.source,
-            "permissions": connector_file.permissions,
-        },
+        meta_in,
+        display_name=connector_file.filename,
     )
-
-    chunks = await chunk_parsed_document_async(parsed_doc)
     if not chunks:
         return 0
 
@@ -516,9 +523,7 @@ async def _ingest_connector_file(
             **connector_file.metadata,
             "permissions": connector_file.permissions,
             "source_id": connector_file.source_id,
-            "filetype": parsed_doc.filetype,
-            "original_filename": parsed_doc.filename,
-            "num_elements": len(parsed_doc.elements),
+            **doc_meta,
         },
     )
     session.add(doc)
