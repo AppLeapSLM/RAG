@@ -15,6 +15,12 @@ logger = logging.getLogger(__name__)
 # RRF constant — standard value from the original paper
 RRF_K = 60
 
+# Each retriever over-fetches this many candidates before RRF fusion.
+# A wider candidate pool means the correct chunk has more chances to be
+# surfaced by at least one retriever, even if its raw rank is modest in
+# either individual system. Downstream we still return `top_k` to the caller.
+RETRIEVER_OVERFETCH = 30
+
 
 async def search(
     query: str,
@@ -24,15 +30,16 @@ async def search(
 ) -> list[Chunk]:
     """Hybrid search: vector similarity + BM25 keyword search, fused with RRF.
 
-    1. Vector search → top_k closest chunks by cosine distance
-    2. Keyword search → top_k best BM25 matches
-    3. Reciprocal Rank Fusion to combine both result sets
+    1. Vector search → RETRIEVER_OVERFETCH closest chunks by cosine distance
+    2. Keyword search → RETRIEVER_OVERFETCH best BM25 matches
+    3. Reciprocal Rank Fusion to combine both result sets → top_k
     4. Optional neighbor expansion (±neighbor_window)
     5. Return top_k final results sorted by (document_id, chunk_index)
     """
-    # Run both searches
-    vector_results = await _vector_search(query, session, top_k=top_k)
-    kw_results = await keyword_search(query, session, top_k=top_k)
+    # Each retriever over-fetches — the final RRF narrows to top_k.
+    pool_size = max(top_k, RETRIEVER_OVERFETCH)
+    vector_results = await _vector_search(query, session, top_k=pool_size)
+    kw_results = await keyword_search(query, session, top_k=pool_size)
 
     logger.info(
         "Hybrid search: %d vector hits, %d keyword hits",
