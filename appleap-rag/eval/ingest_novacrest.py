@@ -64,15 +64,32 @@ def unload_llm(ollama_url: str) -> None:
         print(f"  Warning: Could not unload phi4: {e} (continuing anyway).\n")
 
 
-def ingest_file_via_api(client: httpx.Client, api_url: str, filepath: Path) -> dict:
+def _top_category(filepath: Path, data_dir: Path) -> str:
+    """Return the first path segment under data_dir (e.g. 'kubernetes' for
+    .../novacrest/kubernetes/core/admin-panel.yaml). Falls back to immediate
+    parent if relative_to fails."""
+    try:
+        rel = filepath.relative_to(data_dir)
+        if rel.parts and len(rel.parts) > 1:
+            return rel.parts[0]
+    except ValueError:
+        pass
+    return filepath.parent.name
+
+
+def ingest_file_via_api(client: httpx.Client, api_url: str, filepath: Path, data_dir: Path) -> dict:
     """Ingest a single file via POST /ingest/file."""
-    category = filepath.parent.name
+    category = _top_category(filepath, data_dir)
+    try:
+        rel_path = str(filepath.relative_to(data_dir)).replace("\\", "/")
+    except ValueError:
+        rel_path = filepath.name
 
     with open(filepath, "rb") as f:
         files = {"file": (filepath.name, f)}
         data = {
-            "source": f"novacrest/{category}",
-            "metadata_json": f'{{"category": "{category}", "dataset": "novacrest"}}',
+            "source": f"novacrest/{rel_path}",
+            "metadata_json": f'{{"category": "{category}", "dataset": "novacrest", "rel_path": "{rel_path}"}}',
         }
         response = client.post(f"{api_url}/ingest/file", files=files, data=data, timeout=120.0)
 
@@ -104,11 +121,11 @@ def ingest_text_via_api(client: httpx.Client, api_url: str, filepath: Path) -> d
         return {"error": response.status_code, "detail": response.text}
 
 
-def ingest_one(client: httpx.Client, api_url: str, filepath: Path, file_api_extensions: set) -> dict:
+def ingest_one(client: httpx.Client, api_url: str, filepath: Path, file_api_extensions: set, data_dir: Path) -> dict:
     """Ingest a single file, choosing the right API based on extension."""
     ext = filepath.suffix.lower()
     if ext in file_api_extensions:
-        return ingest_file_via_api(client, api_url, filepath)
+        return ingest_file_via_api(client, api_url, filepath, data_dir)
     else:
         return ingest_text_via_api(client, api_url, filepath)
 
@@ -198,7 +215,7 @@ def main():
         print(f"[{i}/{len(files)}] {category}/{filepath.name}", end=" ... ", flush=True)
 
         try:
-            result = ingest_one(client, args.api_url, filepath, file_api_extensions)
+            result = ingest_one(client, args.api_url, filepath, file_api_extensions, data_dir)
 
             if "error" in result:
                 print(f"FAILED ({result.get('detail', 'unknown')[:80]})")
@@ -232,7 +249,7 @@ def main():
                 print(f"  [retry {attempt + 1}] {category}/{filepath.name}", end=" ... ", flush=True)
 
                 try:
-                    result = ingest_one(client, args.api_url, filepath, file_api_extensions)
+                    result = ingest_one(client, args.api_url, filepath, file_api_extensions, data_dir)
 
                     if "error" in result:
                         print(f"FAILED ({result.get('detail', 'unknown')[:80]})")
