@@ -144,6 +144,7 @@ ALLOWED_EXTENSIONS = {
     ".csv",
     # IaC / config (via tree-sitter)
     ".tf", ".tfvars", ".hcl", ".yaml", ".yml", ".json", ".pp",
+    ".conf",  # misc text config files — fall through to prose path
     # Code (via tree-sitter)
     ".py", ".pyi", ".go", ".rb", ".js", ".mjs", ".cjs", ".jsx",
     ".ts", ".tsx", ".sh", ".bash",

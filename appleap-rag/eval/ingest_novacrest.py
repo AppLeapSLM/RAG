@@ -180,7 +180,12 @@ def main():
     unload_llm(ollama_url)
 
     # File extensions supported by /ingest/file (via Unstructured)
-    file_api_extensions = {".md", ".txt", ".html", ".htm", ".csv", ".json", ".xml"}
+    # Route every supported file through /ingest/file — that endpoint uses
+    # dispatch.process_file, which routes prose → Unstructured and structured
+    # formats (YAML, Puppet, Terraform, JSON, CSV, ...) → tree-sitter.
+    # The legacy /ingest raw-text endpoint bypasses dispatch, so sending
+    # YAML/Puppet/HCL there would silently prose-chunk them.
+    file_api_extensions = set(SUPPORTED_EXTENSIONS)
 
     ingested = 0
     failed_files = []  # (index, filepath) for retry
