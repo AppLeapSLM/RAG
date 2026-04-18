@@ -47,6 +47,13 @@ async def keyword_search(
     Uses ts_rank_cd (cover density ranking) — chunks containing more query
     tokens rank higher. Builds the tsquery with `|` (OR) so long questions
     don't require every stem to appear in a single chunk.
+
+    Length normalization (flag 1): divides rank by `1 + log(doc length)`.
+    Without this, density-biased ts_rank_cd lets long repetitive files
+    (Helm values with N services × M knobs) outrank short focused chunks
+    (a single K8s manifest) because the long file accumulates more token
+    hits. The log-scale penalty evens this out without brutally crushing
+    medium-sized chunks.
     """
     tsquery = _build_or_tsquery(query)
     if not tsquery:
@@ -54,7 +61,7 @@ async def keyword_search(
 
     stmt = text("""
         SELECT id, document_id, content, chunk_index, embedding, metadata, created_at,
-               ts_rank_cd(search_vector, to_tsquery('english', :tsquery)) AS rank
+               ts_rank_cd(search_vector, to_tsquery('english', :tsquery), 1) AS rank
         FROM chunks
         WHERE search_vector @@ to_tsquery('english', :tsquery)
         ORDER BY rank DESC

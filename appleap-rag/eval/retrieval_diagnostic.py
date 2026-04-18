@@ -103,7 +103,7 @@ async def _keyword_search_ranked(
         return []
     stmt = text("""
         SELECT id, document_id, content, chunk_index, embedding, metadata, created_at,
-               ts_rank_cd(search_vector, to_tsquery('english', :tsquery)) AS rank
+               ts_rank_cd(search_vector, to_tsquery('english', :tsquery), 1) AS rank
         FROM chunks
         WHERE search_vector @@ to_tsquery('english', :tsquery)
         ORDER BY rank DESC
