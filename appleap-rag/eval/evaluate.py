@@ -28,25 +28,19 @@ def load_questions(path: Path) -> list[dict]:
 
 
 def source_matches(expected_filename: str, actual_preview: str, actual_source: dict) -> bool:
-    """Check if a retrieved source matches an expected source filename.
+    """Check if a retrieved chunk came from the expected source file.
 
-    Matching is done by checking if the expected filename appears in the
-    content preview or if the source metadata suggests a match. Since we
-    can't see the full document title in the source response, we use
-    content_preview as a heuristic — but the primary match is done below
-    via a separate document lookup.
+    Every chunk's content starts with a bracketed header that includes the
+    original filename — `[Document: init.pp | ...]` for prose chunks and
+    `[File: init.pp | Type: class | ...]` for tree-sitter chunks — so a
+    direct substring match on the filename is the most reliable signal.
+
+    The previous token-based heuristic required ≥3 long tokens and
+    structurally excluded filenames like init.pp, eks.tf.json,
+    api-gateway.yaml, and cmdb-production.csv — every stuck-at-0% category
+    in earlier eval runs.
     """
-    # Normalize: strip extension for comparison
-    expected_base = expected_filename.rsplit(".", 1)[0].lower().replace("-", " ").replace("_", " ")
-    preview_lower = actual_preview.lower()
-
-    # Check if key terms from the filename appear in the preview
-    terms = [t for t in expected_base.split() if len(t) > 3]
-    if len(terms) >= 3:
-        matches = sum(1 for t in terms if t in preview_lower)
-        return matches >= len(terms) * 0.5
-
-    return False
+    return expected_filename.lower() in actual_preview.lower()
 
 
 def evaluate_retrieval(
