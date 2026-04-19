@@ -30,6 +30,10 @@ from backend.generation.llm import generate_answer, rewrite_query
 from backend.parsing.parser import parse_text
 from backend.retrieval.vector_search import search
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 
