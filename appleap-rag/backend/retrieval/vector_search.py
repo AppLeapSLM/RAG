@@ -15,12 +15,13 @@ from backend.retrieval.reranker import rerank
 logger = logging.getLogger(__name__)
 
 # Asymmetric over-fetch — calibrated to retrieval_diagnostic.py observations:
-#   - Vector retrieval hits in the top ~10 or not at all; going wider is
-#     wasted compute for the reranker.
-#   - Keyword retrieval has slower decay — correct chunks have been observed
-#     at ranks 38 and 45 — so we need a wider keyword net.
-VECTOR_OVERFETCH = 15
-KEYWORD_OVERFETCH = 50
+#   - Vector retrieval hits in the top ~10 or not at all; going much wider
+#     is wasted compute for the reranker. Kept at 25 to round up from our
+#     earlier 15 with minimal cost.
+#   - Keyword retrieval has slower decay — correct chunks observed at ranks
+#     38, 45, and 64 post-normalization — so we need a wider keyword net.
+VECTOR_OVERFETCH = 25
+KEYWORD_OVERFETCH = 75
 
 
 async def search(
