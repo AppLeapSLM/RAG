@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     embedding_model: str = "nomic-embed-text"
     llm_model: str = "phi4"
+    llm_num_ctx: int = 16384  # Phi-4's full window; Ollama default is 2048
 
     # Parsing (Unstructured.io — used only as file parser, not for chunking)
     parsing_strategy: str = "auto"  # "auto", "fast", "hi_res", "ocr_only"

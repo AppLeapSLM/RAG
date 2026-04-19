@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 
 import httpx
 
 from backend.config import settings
 from backend.db.models import Chunk
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
     "You are AppLeap, a technical support assistant for IT Operations. "
@@ -58,11 +61,20 @@ async def _llm_generate(system: str, prompt: str, model: str | None = None) -> s
                 "system": system,
                 "prompt": prompt,
                 "stream": False,
+                "options": {"num_ctx": settings.llm_num_ctx},
             },
             timeout=600.0,
         )
         response.raise_for_status()
-        return response.json()["response"]
+        data = response.json()
+        logger.info(
+            "llm_generate model=%s num_ctx=%d prompt_tokens=%s eval_tokens=%s",
+            model,
+            settings.llm_num_ctx,
+            data.get("prompt_eval_count"),
+            data.get("eval_count"),
+        )
+        return data["response"]
 
 
 # ── Query rewriting ────────────────────────────────────────────────
