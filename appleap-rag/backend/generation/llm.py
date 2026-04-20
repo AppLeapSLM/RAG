@@ -67,13 +67,20 @@ async def _llm_generate(system: str, prompt: str, model: str | None = None) -> s
         )
         response.raise_for_status()
         data = response.json()
-        logger.info(
-            "llm_generate model=%s num_ctx=%d prompt_tokens=%s eval_tokens=%s",
-            model,
-            settings.llm_num_ctx,
-            data.get("prompt_eval_count"),
-            data.get("eval_count"),
-        )
+        pt = data.get("prompt_eval_count")
+        et = data.get("eval_count")
+        # 14000 = 86% of Phi-4's 16K ceiling. Beyond this Ollama starts to
+        # silently truncate the prompt and the answer quality degrades.
+        if pt is not None and pt > 14000:
+            logger.warning(
+                "llm_generate prompt_tokens=%d approaching num_ctx=%d (truncation risk)",
+                pt, settings.llm_num_ctx,
+            )
+        else:
+            logger.info(
+                "llm_generate model=%s num_ctx=%d prompt_tokens=%s eval_tokens=%s",
+                model, settings.llm_num_ctx, pt, et,
+            )
         return data["response"]
 
 
@@ -116,22 +123,39 @@ async def rewrite_query(question: str, history: list[dict]) -> str:
 # ── Context building ───────────────────────────────────────────────
 
 
-def build_context_block(chunks: list[Chunk]) -> str:
+def build_context_block(
+    chunks: list[Chunk],
+    inline_attachments: list | None = None,
+) -> str:
     """Build a document-aware context block from retrieved chunks.
 
     Groups chunks by source document and preserves reading order
     (chunks are already sorted by document_id, chunk_index from retrieval).
     Respects the max_context_chars cap.
+
+    `inline_attachments` — optional list of `ConversationInlineAttachment`
+    rows whose full text is prepended as the first section, before any
+    retrieved chunks. User-attached files take priority over retrieval.
+    Inline attachments bypass the `max_context_chars` cap (they are the
+    user's own context and must appear in full — overflow is monitored
+    via the prompt_tokens warning in `_llm_generate`).
     """
+    sections: list[str] = []
+
+    if inline_attachments:
+        for a in inline_attachments:
+            sections.append(
+                f'From user-attached file "{a.filename}":\n{a.text_content}'
+            )
+
     if not chunks:
-        return ""
+        return "\n---\n\n".join(sections) if sections else ""
 
     # Group chunks by document, preserving order
     doc_groups: dict[str, list[Chunk]] = defaultdict(list)
     for chunk in chunks:
         doc_groups[chunk.document_id].append(chunk)
 
-    sections: list[str] = []
     total_chars = 0
 
     for doc_id, doc_chunks in doc_groups.items():
@@ -202,13 +226,16 @@ async def generate_answer(
     question: str,
     chunks: list[Chunk],
     history: list[dict] | None = None,
+    inline_attachments: list | None = None,
 ) -> str:
     """Send retrieved context + question (with optional conversation history)
     to the LLM and return the answer.
 
     history is a list of {"role": "user"|"assistant", "content": "..."} dicts.
+    inline_attachments is a list of ConversationInlineAttachment rows whose
+    full text is prepended to the context block ahead of retrieved chunks.
     """
-    context_block = build_context_block(chunks)
+    context_block = build_context_block(chunks, inline_attachments=inline_attachments)
     history_block = build_history_block(history) if history else ""
 
     parts: list[str] = []

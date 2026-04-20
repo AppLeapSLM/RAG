@@ -22,10 +22,45 @@ class Document(Base):
     )
     source: Mapped[str] = mapped_column(String, nullable=False)
     title: Mapped[str] = mapped_column(String, nullable=False)
+    # 'corpus' = permanent knowledge base; 'attachment' = chat-scoped chunked file
+    source_type: Mapped[str] = mapped_column(String, nullable=False, default="corpus")
+    # Set only when source_type='attachment'; NULL for corpus docs
+    conversation_id: Mapped[Optional[str]] = mapped_column(
+        String,
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
     metadata_: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)
+
+
+class ConversationInlineAttachment(Base):
+    """Chat-scoped file whose full text is prepended to every turn's context.
+
+    For files whose extracted text is ≤ inline_attachment_threshold_kb. Not
+    embedded, not indexed — always read fully on every /query for this conv.
+    """
+    __tablename__ = "conversation_inline_attachments"
+
+    id: Mapped[str] = mapped_column(
+        String, primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    filename: Mapped[str] = mapped_column(String, nullable=False)
+    mime_type: Mapped[str] = mapped_column(String, nullable=False)
+    text_content: Mapped[str] = mapped_column(Text, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
 
 
 class Chunk(Base):

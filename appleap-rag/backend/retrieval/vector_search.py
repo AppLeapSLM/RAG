@@ -3,11 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings
-from backend.db.models import Chunk
+from backend.db.models import Chunk, Document
 from backend.embedding.embedder import embed_text
 from backend.retrieval.keyword_search import keyword_search
 from backend.retrieval.reranker import rerank
@@ -29,6 +29,7 @@ async def search(
     session: AsyncSession,
     top_k: int = settings.top_k,
     neighbor_window: int = settings.neighbor_window,
+    conversation_id: str | None = None,
 ) -> list[Chunk]:
     """Hybrid search: vector + keyword → union → cross-encoder rerank → top_k.
 
@@ -42,9 +43,17 @@ async def search(
 
     No RRF: a cross-encoder overrides whatever order RRF produces, so RRF
     becomes dead weight. See CLAUDE.md V8 Phase 2.
+
+    Scope:
+    - When `conversation_id` is None: corpus only.
+    - When set: corpus + chunked attachments tagged to that conversation.
     """
-    vector_task = _vector_search(query, session, top_k=VECTOR_OVERFETCH)
-    keyword_task = keyword_search(query, session, top_k=KEYWORD_OVERFETCH)
+    vector_task = _vector_search(
+        query, session, top_k=VECTOR_OVERFETCH, conversation_id=conversation_id
+    )
+    keyword_task = keyword_search(
+        query, session, top_k=KEYWORD_OVERFETCH, conversation_id=conversation_id
+    )
     vector_results, keyword_results = await asyncio.gather(vector_task, keyword_task)
 
     # Union + dedupe by chunk_id. First occurrence wins; order doesn't matter
@@ -73,12 +82,30 @@ async def _vector_search(
     query: str,
     session: AsyncSession,
     top_k: int,
+    conversation_id: str | None = None,
 ) -> list[Chunk]:
-    """Pure vector similarity search via pgvector cosine distance."""
+    """Pure vector similarity search via pgvector cosine distance.
+
+    Scopes results to corpus docs plus (optionally) chunked attachments
+    tagged to `conversation_id`. Never returns other conversations' attachments.
+    """
     query_embedding = await embed_text(query)
+
+    if conversation_id:
+        scope_filter = or_(
+            Document.source_type == "corpus",
+            and_(
+                Document.source_type == "attachment",
+                Document.conversation_id == conversation_id,
+            ),
+        )
+    else:
+        scope_filter = Document.source_type == "corpus"
 
     stmt = (
         select(Chunk)
+        .join(Document, Chunk.document_id == Document.id)
+        .where(scope_filter)
         .order_by(Chunk.embedding.cosine_distance(query_embedding))
         .limit(top_k)
     )

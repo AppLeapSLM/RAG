@@ -18,8 +18,15 @@ class Settings(BaseSettings):
     chunk_size: int = 3000          # hard max characters per chunk
     chunk_overlap: int = 200        # characters of overlap between consecutive chunks
 
-    # File upload
-    max_upload_size_mb: int = 50
+    # File upload (corpus — admin-only, CLI/connectors)
+    max_upload_size_mb: int = 200
+
+    # Chat attachments (conversation-scoped, user-facing)
+    max_chat_upload_mb: int = 5
+    inline_attachment_threshold_kb: int = 20  # ≤ this inlined, > this chunked
+
+    # Admin token for /ingest/file (empty = no gate, dev only)
+    admin_token: str = ""
 
     # Retrieval
     top_k: int = 5

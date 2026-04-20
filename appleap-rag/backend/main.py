@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,7 +24,7 @@ try:
 except ImportError:
     _GDRIVE_AVAILABLE = False
 from backend.db.connection import async_session, engine, get_session
-from backend.db.models import Base, Chunk, Conversation, Document, Message
+from backend.db.models import Base, Chunk, Conversation, ConversationInlineAttachment, Document, Message
 from backend.embedding.embedder import embed_batch
 from backend.generation.llm import generate_answer, rewrite_query
 from backend.parsing.parser import parse_text
@@ -45,6 +45,35 @@ async def lifespan(app: FastAPI):
             __import__("sqlalchemy").text("CREATE EXTENSION IF NOT EXISTS vector")
         )
         await conn.run_sync(Base.metadata.create_all)
+
+        # Migrate documents table: add source_type + conversation_id for chat attachments
+        await conn.execute(__import__("sqlalchemy").text("""
+            ALTER TABLE documents
+            ADD COLUMN IF NOT EXISTS source_type VARCHAR(32) NOT NULL DEFAULT 'corpus'
+        """))
+        await conn.execute(__import__("sqlalchemy").text("""
+            ALTER TABLE documents
+            ADD COLUMN IF NOT EXISTS conversation_id VARCHAR
+                REFERENCES conversations(id) ON DELETE CASCADE
+        """))
+        await conn.execute(__import__("sqlalchemy").text("""
+            CREATE INDEX IF NOT EXISTS idx_documents_conv_id
+            ON documents(conversation_id)
+        """))
+        await conn.execute(__import__("sqlalchemy").text("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'ck_documents_source_type_conv_id'
+                ) THEN
+                    ALTER TABLE documents ADD CONSTRAINT ck_documents_source_type_conv_id
+                    CHECK (
+                        (source_type = 'corpus' AND conversation_id IS NULL)
+                        OR (source_type = 'attachment' AND conversation_id IS NOT NULL)
+                    );
+                END IF;
+            END $$
+        """))
 
         # Full-text search: add tsvector column + GIN index + auto-populate trigger
         await conn.execute(__import__("sqlalchemy").text("""
@@ -198,23 +227,50 @@ async def ingest(req: IngestRequest, session: AsyncSession = Depends(get_session
     return IngestResponse(document_id=doc.id, chunks_stored=len(chunks))
 
 
-@app.post("/ingest/file", response_model=IngestResponse)
+def require_admin_token(x_admin_token: str | None = Header(default=None)):
+    """Gate for admin-only endpoints (corpus ingestion).
+
+    If `admin_token` setting is empty, the gate is open (dev convenience).
+    Otherwise the caller must send a matching `X-Admin-Token` header.
+    """
+    if not settings.admin_token:
+        return
+    if x_admin_token != settings.admin_token:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+
+def _classify_extension(filename: str) -> str:
+    """Return the canonical extension, handling .tf.json as a two-segment suffix."""
+    lower = filename.lower()
+    if lower.endswith(".tf.json"):
+        return ".tf.json"
+    return Path(filename).suffix.lower()
+
+
+@app.post(
+    "/ingest/file",
+    response_model=IngestResponse,
+    dependencies=[Depends(require_admin_token)],
+)
 async def ingest_file(
     file: UploadFile = File(...),
     source: str = Form(default="upload"),
     metadata_json: str = Form(default="{}"),
     session: AsyncSession = Depends(get_session),
 ):
-    """Ingest a file: parse via Unstructured → chunk → embed → store."""
+    """Corpus ingest (admin-only): parse via Unstructured → chunk → embed → store."""
     # 1. Validate file
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided")
 
-    ext = Path(file.filename).suffix.lower()
+    ext = _classify_extension(file.filename)
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type: {ext}. Allowed: {sorted(ALLOWED_EXTENSIONS)}",
+            detail=(
+                f"File type '{ext}' is not supported. "
+                f"Supported types: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+            ),
         )
 
     try:
@@ -228,8 +284,11 @@ async def ingest_file(
         raise HTTPException(status_code=400, detail="Empty file")
     if len(content) > settings.max_upload_size_mb * 1024 * 1024:
         raise HTTPException(
-            status_code=400,
-            detail=f"File too large. Max: {settings.max_upload_size_mb}MB",
+            status_code=413,
+            detail=(
+                f"File too large. Please upload a file less than "
+                f"{settings.max_upload_size_mb}MB."
+            ),
         )
 
     # .tf.json needs a two-segment suffix so tempfile preserves it for classification
@@ -319,14 +378,41 @@ async def query(req: QueryRequest, session: AsyncSession = Depends(get_session))
 
     history = [{"role": m.role, "content": m.content} for m in rows]
 
+    # 2b. Load inline attachments for this conversation (prepended to context).
+    inline_rows = (
+        await session.execute(
+            sa_select(ConversationInlineAttachment)
+            .where(ConversationInlineAttachment.conversation_id == conv.id)
+            .order_by(ConversationInlineAttachment.created_at)
+        )
+    ).scalars().all()
+    inline_attachments = list(inline_rows)
+    if inline_attachments:
+        total_inline_bytes = sum(a.size_bytes for a in inline_attachments)
+        # 40960 bytes ≈ 10K tokens — start of the danger zone for 16K num_ctx
+        # when combined with history + retrieved context. See
+        # project_inline_attachment_overflow memory.
+        if total_inline_bytes > 40 * 1024:
+            logger.warning(
+                "inline_attachments large conv=%s count=%d total_bytes=%d",
+                conv.id, len(inline_attachments), total_inline_bytes,
+            )
+
     # 3. Rewrite query using history (resolves pronouns, references)
     search_query = await rewrite_query(req.question, history)
 
-    # 4. Retrieve relevant chunks using the rewritten query
-    results = await search(search_query, session, top_k=req.top_k)
+    # 4. Retrieve relevant chunks — corpus + this conv's chunked attachments
+    results = await search(
+        search_query, session, top_k=req.top_k, conversation_id=conv.id
+    )
 
-    # 5. Generate answer with full conversation history
-    answer = await generate_answer(req.question, results, history=history)
+    # 5. Generate answer with full history + inline attachments + retrieved chunks
+    answer = await generate_answer(
+        req.question,
+        results,
+        history=history,
+        inline_attachments=inline_attachments,
+    )
 
     # 6. Build source metadata
     sources = [
@@ -412,6 +498,17 @@ async def list_conversations(session: AsyncSession = Depends(get_session)):
     ]
 
 
+@app.post("/conversations")
+async def create_conversation(session: AsyncSession = Depends(get_session)):
+    """Create an empty conversation. Useful when the UI needs a conv_id
+    before sending a message (e.g., to attach a file first)."""
+    conv = Conversation(title="New Chat")
+    session.add(conv)
+    await session.flush()
+    await session.commit()
+    return {"id": conv.id, "title": conv.title}
+
+
 @app.get("/conversations/{conversation_id}", response_model=ConversationDetail)
 async def get_conversation(
     conversation_id: str,
@@ -490,6 +587,223 @@ async def delete_conversation(
     )
     await session.commit()
     return {"deleted": conversation_id}
+
+
+# ── Chat attachments ───────────────────────────────────────────────
+
+
+@app.post("/conversations/{conversation_id}/attachments")
+async def upload_attachment(
+    conversation_id: str,
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_session),
+):
+    """Upload a file scoped to one conversation.
+
+    ≤ `inline_attachment_threshold_kb` → stored as inline (full text prepended
+    to every turn's context). Otherwise → parsed, chunked, embedded, and
+    stored as a conversation-scoped document that participates in retrieval
+    only for this conversation.
+    """
+    conv = await session.get(Conversation, conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided")
+
+    ext = _classify_extension(file.filename)
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"File type '{ext}' is not supported. "
+                f"Supported types: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+            ),
+        )
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(content) > settings.max_chat_upload_mb * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"File too large. Please upload a file less than "
+                f"{settings.max_chat_upload_mb}MB."
+            ),
+        )
+
+    suffix = ".tf.json" if file.filename.lower().endswith(".tf.json") else ext
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    try:
+        os.write(tmp_fd, content)
+        os.close(tmp_fd)
+
+        chunks, doc_meta = await process_file(
+            tmp_path,
+            {"title": file.filename, "source": "chat_upload"},
+            display_name=file.filename,
+        )
+        if not chunks:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not extract any content from the file.",
+            )
+
+        extracted_text = "\n\n".join(c["text"] for c in chunks)
+        text_bytes = len(extracted_text.encode("utf-8"))
+        inline_limit = settings.inline_attachment_threshold_kb * 1024
+
+        if text_bytes <= inline_limit:
+            attachment = ConversationInlineAttachment(
+                conversation_id=conversation_id,
+                filename=file.filename,
+                mime_type=file.content_type or "application/octet-stream",
+                text_content=extracted_text,
+                size_bytes=text_bytes,
+            )
+            session.add(attachment)
+            await session.commit()
+            logger.info(
+                "inline_attachment conv=%s file=%s bytes=%d",
+                conversation_id, file.filename, text_bytes,
+            )
+            return {
+                "attachment_id": attachment.id,
+                "filename": attachment.filename,
+                "mode": "inline",
+                "size_bytes": attachment.size_bytes,
+                "chunks": None,
+            }
+
+        # Chunked path: create conversation-scoped Document + embed Chunks
+        doc = Document(
+            source="chat_upload",
+            title=file.filename,
+            source_type="attachment",
+            conversation_id=conversation_id,
+            metadata_={"title": file.filename, **doc_meta},
+        )
+        session.add(doc)
+        await session.flush()
+
+        chunk_texts = [c["text"] for c in chunks]
+        embeddings = await embed_batch(chunk_texts)
+        for i, (chunk_data, emb) in enumerate(zip(chunks, embeddings)):
+            chunk = Chunk(
+                document_id=doc.id,
+                content=chunk_data["text"],
+                chunk_index=i,
+                embedding=emb,
+                metadata_={
+                    **chunk_data["metadata"],
+                    "element_types": chunk_data["element_types"],
+                },
+            )
+            session.add(chunk)
+
+        await session.commit()
+        logger.info(
+            "chunked_attachment conv=%s file=%s bytes=%d chunks=%d",
+            conversation_id, file.filename, text_bytes, len(chunks),
+        )
+        return {
+            "attachment_id": doc.id,
+            "filename": file.filename,
+            "mode": "chunked",
+            "size_bytes": text_bytes,
+            "chunks": len(chunks),
+        }
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+@app.get("/conversations/{conversation_id}/attachments")
+async def list_attachments(
+    conversation_id: str,
+    session: AsyncSession = Depends(get_session),
+):
+    """List all attachments (inline + chunked) for a conversation."""
+    from sqlalchemy import select as sa_select
+
+    conv = await session.get(Conversation, conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    inline_rows = (
+        await session.execute(
+            sa_select(ConversationInlineAttachment)
+            .where(ConversationInlineAttachment.conversation_id == conversation_id)
+            .order_by(ConversationInlineAttachment.created_at)
+        )
+    ).scalars().all()
+
+    chunked_rows = (
+        await session.execute(
+            sa_select(Document)
+            .where(Document.source_type == "attachment")
+            .where(Document.conversation_id == conversation_id)
+            .order_by(Document.created_at)
+        )
+    ).scalars().all()
+
+    items = []
+    for a in inline_rows:
+        items.append({
+            "attachment_id": a.id,
+            "filename": a.filename,
+            "mode": "inline",
+            "size_bytes": a.size_bytes,
+            "created_at": a.created_at.isoformat(),
+        })
+    for d in chunked_rows:
+        items.append({
+            "attachment_id": d.id,
+            "filename": d.title,
+            "mode": "chunked",
+            "size_bytes": None,
+            "created_at": d.created_at.isoformat(),
+        })
+    return items
+
+
+@app.delete("/conversations/{conversation_id}/attachments/{attachment_id}")
+async def delete_attachment(
+    conversation_id: str,
+    attachment_id: str,
+    session: AsyncSession = Depends(get_session),
+):
+    """Remove a single attachment (inline or chunked) from a conversation."""
+    from sqlalchemy import delete as sa_delete
+
+    conv = await session.get(Conversation, conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    inline = await session.get(ConversationInlineAttachment, attachment_id)
+    if inline and inline.conversation_id == conversation_id:
+        await session.delete(inline)
+        await session.commit()
+        return {"deleted": attachment_id, "mode": "inline"}
+
+    doc = await session.get(Document, attachment_id)
+    if (
+        doc
+        and doc.source_type == "attachment"
+        and doc.conversation_id == conversation_id
+    ):
+        await session.execute(
+            sa_delete(Chunk).where(Chunk.document_id == attachment_id)
+        )
+        await session.delete(doc)
+        await session.commit()
+        return {"deleted": attachment_id, "mode": "chunked"}
+
+    raise HTTPException(status_code=404, detail="Attachment not found")
 
 
 # ── Google Drive connector ─────────────────────────────────────────

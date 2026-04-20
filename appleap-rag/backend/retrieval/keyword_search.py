@@ -41,6 +41,7 @@ async def keyword_search(
     query: str,
     session: AsyncSession,
     top_k: int = settings.top_k,
+    conversation_id: str | None = None,
 ) -> list[Chunk]:
     """BM25-style keyword search using PostgreSQL full-text search with OR semantics.
 
@@ -54,22 +55,41 @@ async def keyword_search(
     (a single K8s manifest) because the long file accumulates more token
     hits. The log-scale penalty evens this out without brutally crushing
     medium-sized chunks.
+
+    Scope (via JOIN documents):
+    - conversation_id=None → corpus only
+    - conversation_id set  → corpus + attachments for that conversation
     """
     tsquery = _build_or_tsquery(query)
     if not tsquery:
         return []
 
-    stmt = text("""
-        SELECT id, document_id, content, chunk_index, embedding, metadata, created_at,
-               ts_rank_cd(search_vector, to_tsquery('english', :tsquery), 1) AS rank
-        FROM chunks
-        WHERE search_vector @@ to_tsquery('english', :tsquery)
+    if conversation_id:
+        scope_clause = (
+            "AND (d.source_type = 'corpus' "
+            "OR (d.source_type = 'attachment' AND d.conversation_id = :conv_id))"
+        )
+    else:
+        scope_clause = "AND d.source_type = 'corpus'"
+
+    stmt = text(f"""
+        SELECT c.id, c.document_id, c.content, c.chunk_index, c.embedding,
+               c.metadata, c.created_at,
+               ts_rank_cd(c.search_vector, to_tsquery('english', :tsquery), 1) AS rank
+        FROM chunks c
+        JOIN documents d ON c.document_id = d.id
+        WHERE c.search_vector @@ to_tsquery('english', :tsquery)
+        {scope_clause}
         ORDER BY rank DESC
         LIMIT :top_k
     """)
 
+    params: dict = {"tsquery": tsquery, "top_k": top_k}
+    if conversation_id:
+        params["conv_id"] = conversation_id
+
     try:
-        result = await session.execute(stmt, {"tsquery": tsquery, "top_k": top_k})
+        result = await session.execute(stmt, params)
         rows = result.fetchall()
     except Exception as e:
         # Defensive: if to_tsquery ever rejects the generated expression
