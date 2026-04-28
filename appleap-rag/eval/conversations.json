@@ -1,0 +1,303 @@
+[
+  {
+    "id": "CONV-01",
+    "category": "kubernetes",
+    "tests": "coreference (its = auth-service)",
+    "turns": [
+      {
+        "question": "What are the CPU and memory resource requests and limits for the auth-service Kubernetes deployment?",
+        "expected_sources": ["auth-service.yaml"]
+      },
+      {
+        "question": "What about its anti-affinity rule?",
+        "expected_sources": ["auth-service.yaml"]
+      }
+    ]
+  },
+  {
+    "id": "CONV-02",
+    "category": "adr",
+    "tests": "topic followup on prior ADR",
+    "turns": [
+      {
+        "question": "Why did NovaCrest choose ClickHouse over TimescaleDB for metrics storage?",
+        "expected_sources": ["adr-adr-001-choosing-clickhouse-over-timescaledb-for-metrics-storage.md"]
+      },
+      {
+        "question": "What was the projected monthly cost savings?",
+        "expected_sources": ["adr-adr-001-choosing-clickhouse-over-timescaledb-for-metrics-storage.md"]
+      }
+    ]
+  },
+  {
+    "id": "CONV-03",
+    "category": "incident",
+    "tests": "pronoun resolution (it = the incident)",
+    "turns": [
+      {
+        "question": "Tell me about the December 2022 billing double-charge incident.",
+        "expected_sources": ["INC-2023-013-billing-service-double-charging-during-kafka-rebalance.md"]
+      },
+      {
+        "question": "Who was the incident commander?",
+        "expected_sources": ["INC-2023-013-billing-service-double-charging-during-kafka-rebalance.md"]
+      }
+    ]
+  },
+  {
+    "id": "CONV-04",
+    "category": "cross-document",
+    "tests": "deep K8s drill-down with cross-service compare",
+    "turns": [
+      {
+        "question": "What CPU and memory limits does ingest-service have in its Kubernetes deployment?",
+        "expected_sources": ["ingest-service.yaml"]
+      },
+      {
+        "question": "What about its replica count and HPA configuration?",
+        "expected_sources": ["ingest-service.yaml"]
+      },
+      {
+        "question": "How do those HPA limits compare to auth-service's?",
+        "expected_sources": ["auth-service.yaml", "ingest-service.yaml"]
+      }
+    ]
+  },
+  {
+    "id": "CONV-05",
+    "category": "runbook",
+    "tests": "drill-down into runbook with implicit subject",
+    "turns": [
+      {
+        "question": "What is the duration of the JWT key overlap window during a scheduled auth-service key rotation?",
+        "expected_sources": ["auth-service-jwt-key-rotation-procedure.md"]
+      },
+      {
+        "question": "What happens differently during an emergency rotation?",
+        "expected_sources": ["auth-service-jwt-key-rotation-procedure.md"]
+      },
+      {
+        "question": "What is the brief outage that emergency rotation causes?",
+        "expected_sources": ["auth-service-jwt-key-rotation-procedure.md"]
+      }
+    ]
+  },
+  {
+    "id": "CONV-06",
+    "category": "topology",
+    "tests": "topic shift across environments",
+    "turns": [
+      {
+        "question": "What AWS region is the production environment in, per the topology environment matrix?",
+        "expected_sources": ["environment-matrix.json"]
+      },
+      {
+        "question": "What's its VPC CIDR?",
+        "expected_sources": ["environment-matrix.json"]
+      },
+      {
+        "question": "What about the staging environment? Same questions.",
+        "expected_sources": ["environment-matrix.json"]
+      }
+    ]
+  },
+  {
+    "id": "CONV-07",
+    "category": "incident",
+    "tests": "topic shift to a similar incident",
+    "turns": [
+      {
+        "question": "What caused INC-2023-022, the multi-region failover incident?",
+        "expected_sources": ["INC-2023-022-multi-region-failover-triggered-by-us-east-1-networking-issue.md"]
+      },
+      {
+        "question": "How was that AWS networking event detected and rolled back?",
+        "expected_sources": ["INC-2023-022-multi-region-failover-triggered-by-us-east-1-networking-issue.md"]
+      },
+      {
+        "question": "Has there been a similar Istio-related incident in 2026?",
+        "expected_sources": ["INC-2026-092-istio-sidecar-injection-failure-after-control-plane-upgrade.md"]
+      }
+    ]
+  },
+  {
+    "id": "CONV-08",
+    "category": "cross-document",
+    "tests": "playbook → ADR cross-doc chain",
+    "turns": [
+      {
+        "question": "How much raw storage does NovaCrest's ClickHouse cluster currently hold?",
+        "expected_sources": ["capacity-clickhouse-storage-capacity-planning.md"]
+      },
+      {
+        "question": "Who approves the ClickHouse capacity-planning procedure?",
+        "expected_sources": ["capacity-clickhouse-storage-capacity-planning.md"]
+      },
+      {
+        "question": "What sharding strategy did ADR-001 originally decide on?",
+        "expected_sources": ["adr-adr-001-choosing-clickhouse-over-timescaledb-for-metrics-storage.md"]
+      }
+    ]
+  },
+  {
+    "id": "CONV-09",
+    "category": "playbook",
+    "tests": "drill into Vault recovery procedure",
+    "turns": [
+      {
+        "question": "What Shamir threshold is used for unsealing Vault at NovaCrest?",
+        "expected_sources": ["security-vault-unseal-procedure.md"]
+      },
+      {
+        "question": "Who are the key holders?",
+        "expected_sources": ["security-vault-unseal-procedure.md"]
+      },
+      {
+        "question": "What should the operator do if a cluster split-brain is detected after unsealing?",
+        "expected_sources": ["security-vault-unseal-procedure.md"]
+      }
+    ]
+  },
+  {
+    "id": "CONV-10",
+    "category": "cross-document",
+    "tests": "infra config → ADR decision chain",
+    "turns": [
+      {
+        "question": "What Kafka version does NovaCrest's MSK cluster currently run, per the Terraform config?",
+        "expected_sources": ["msk.tf.json"]
+      },
+      {
+        "question": "What server-level Kafka properties are enforced?",
+        "expected_sources": ["msk.tf.json"]
+      },
+      {
+        "question": "Which ADR decided to migrate away from MSK?",
+        "expected_sources": ["adr-adr-013-kafka-msk-vs-self-hosted-kafka.md"]
+      }
+    ]
+  },
+  {
+    "id": "CONV-11",
+    "category": "cross-document",
+    "tests": "incident → runbook chain (4-turn)",
+    "turns": [
+      {
+        "question": "What was the customer impact of INC-2023-013, the billing double-charge incident?",
+        "expected_sources": ["INC-2023-013-billing-service-double-charging-during-kafka-rebalance.md"]
+      },
+      {
+        "question": "What was the technical root cause?",
+        "expected_sources": ["INC-2023-013-billing-service-double-charging-during-kafka-rebalance.md"]
+      },
+      {
+        "question": "What runbook covers payment failure handling in billing-service?",
+        "expected_sources": ["billing-service-payment-failure-handling.md"]
+      },
+      {
+        "question": "What is the payment retry schedule that runbook describes?",
+        "expected_sources": ["billing-service-payment-failure-handling.md"]
+      }
+    ]
+  },
+  {
+    "id": "CONV-12",
+    "category": "cross-document",
+    "tests": "service config across helm + topology + cmdb (4-turn)",
+    "turns": [
+      {
+        "question": "How is api-gateway configured in the production Helm values file?",
+        "expected_sources": ["values-production.yaml"]
+      },
+      {
+        "question": "How does that compare to the development overrides?",
+        "expected_sources": ["values-development.yaml"]
+      },
+      {
+        "question": "What CPU and memory requests does the topology environment matrix list for api-gateway in production?",
+        "expected_sources": ["environment-matrix.json"]
+      },
+      {
+        "question": "What does the CMDB say about its tier and current status?",
+        "expected_sources": ["cmdb-production.csv"]
+      }
+    ]
+  },
+  {
+    "id": "CONV-13",
+    "category": "adr",
+    "tests": "ADR metadata cascade (4-turn)",
+    "turns": [
+      {
+        "question": "What does ADR-013 decide about NovaCrest's Kafka platform?",
+        "expected_sources": ["adr-adr-013-kafka-msk-vs-self-hosted-kafka.md"]
+      },
+      {
+        "question": "What earlier ADR did it supersede?",
+        "expected_sources": ["adr-adr-013-kafka-msk-vs-self-hosted-kafka.md"]
+      },
+      {
+        "question": "What other ADRs does it list as related?",
+        "expected_sources": ["adr-adr-013-kafka-msk-vs-self-hosted-kafka.md"]
+      },
+      {
+        "question": "What is the projected 3-year cost savings of the migration?",
+        "expected_sources": ["adr-adr-013-kafka-msk-vs-self-hosted-kafka.md"]
+      }
+    ]
+  },
+  {
+    "id": "CONV-14",
+    "category": "cross-document",
+    "tests": "deep auth flow drill-down (5-turn)",
+    "turns": [
+      {
+        "question": "What is auth-service's primary responsibility per the architecture doc?",
+        "expected_sources": ["architecture-authentication-and-authorization-architecture.md"]
+      },
+      {
+        "question": "What database does it use?",
+        "expected_sources": ["architecture-authentication-and-authorization-architecture.md"]
+      },
+      {
+        "question": "What's the JWT key rotation procedure for it?",
+        "expected_sources": ["auth-service-jwt-key-rotation-procedure.md"]
+      },
+      {
+        "question": "How long is the overlap window during a scheduled rotation?",
+        "expected_sources": ["auth-service-jwt-key-rotation-procedure.md"]
+      },
+      {
+        "question": "What is the trade-off in the emergency rotation path?",
+        "expected_sources": ["auth-service-jwt-key-rotation-procedure.md"]
+      }
+    ]
+  },
+  {
+    "id": "CONV-15",
+    "category": "cross-document",
+    "tests": "explicit recall of earlier turn (5-turn)",
+    "turns": [
+      {
+        "question": "What is the production Kubernetes cluster name in environment-matrix.json?",
+        "expected_sources": ["environment-matrix.json"]
+      },
+      {
+        "question": "What VPC CIDR is configured for that production environment?",
+        "expected_sources": ["environment-matrix.json"]
+      },
+      {
+        "question": "Was there a 2023 incident that triggered a multi-region failover from us-east-1?",
+        "expected_sources": ["INC-2023-022-multi-region-failover-triggered-by-us-east-1-networking-issue.md"]
+      },
+      {
+        "question": "What was the AWS-confirmed root cause of that incident?",
+        "expected_sources": ["INC-2023-022-multi-region-failover-triggered-by-us-east-1-networking-issue.md"]
+      },
+      {
+        "question": "Going back to the cluster name we started with — what was it again?",
+        "expected_sources": ["environment-matrix.json"]
+      }
+    ]
+  }
+]

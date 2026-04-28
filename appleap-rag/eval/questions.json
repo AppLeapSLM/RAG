@@ -1,244 +1,690 @@
 [
   {
     "id": "INC-01",
-    "question": "How many customers were affected by the Elasticsearch disk watermark breach incident?",
-    "expected_answer": "823 enterprise customers were affected with 15-45 minute delays in log ingestion.",
-    "expected_sources": ["INC-2022-001-elasticsearch-disk-watermark-breach-blocking-log-ingestion.md"],
+    "question": "How many enterprise customers were double-charged in the INC-2023-013 billing incident, and what was the total duplicate-charge amount?",
+    "expected_answer": "278 enterprise customers (34.75% of the enterprise tier) were double-charged, for a total of $47,300 in duplicate charges.",
+    "expected_sources": ["INC-2023-013-billing-service-double-charging-during-kafka-rebalance.md"],
     "category": "incident",
     "difficulty": "easy"
   },
   {
     "id": "INC-02",
-    "question": "Who was the incident commander for the Elasticsearch disk watermark breach and what was the estimated SLA credit impact?",
-    "expected_answer": "Sarah Chen (Platform Engineering) was the IC. The estimated SLA credit impact was $12,000.",
-    "expected_sources": ["INC-2022-001-elasticsearch-disk-watermark-breach-blocking-log-ingestion.md"],
+    "question": "How long had the session-store memory leak been accumulating before automated monitoring detected it in INC-2025-080?",
+    "expected_answer": "Approximately 72 hours. The leak began after a deployment of session-store v1.14.3 on February 26, 2025, at 18:00 UTC, and was detected by automated monitoring on March 1, 2025, at 13:28 UTC.",
+    "expected_sources": ["INC-2025-080-session-store-memory-leak-detected-over-72-hours.md"],
+    "category": "incident",
+    "difficulty": "easy"
+  },
+  {
+    "id": "INC-03",
+    "question": "What was the technical root cause that allowed both cron-dispatcher replicas to acquire the same Redis lock during INC-2023-013, and how was it fixed?",
+    "expected_answer": "A race condition between the EXISTS check and the SET command in the lock acquisition logic — the two operations were non-atomic. During a brief network partition caused by a Kafka consumer group rebalance (broker kafka-3 in us-east-1a undergoing routine maintenance restart), both replicas executed EXISTS, both saw 'not exists', and both proceeded to SET before either could read the other's write. The fix replaced the EXISTS+SET pattern with Redis SETNX implemented via a Lua script for atomic check-and-set.",
+    "expected_sources": ["INC-2023-013-billing-service-double-charging-during-kafka-rebalance.md"],
     "category": "incident",
     "difficulty": "medium"
   },
   {
-    "id": "INC-03",
-    "question": "What caused the Kafka consumer lag to peak at 847,392 messages for the log-processor?",
-    "expected_answer": "The ILM policy failed to transition old indices because warm nodes were at 81% disk capacity, and Acme Corp had a 3x log volume spike from 800GB/day to 2.4TB/day due to deploying 400 new Kubernetes clusters.",
-    "expected_sources": ["INC-2022-001-elasticsearch-disk-watermark-breach-blocking-log-ingestion.md"],
+    "id": "INC-04",
+    "question": "What caused the Istio sidecar injection failures in INC-2026-092, and why didn't cert-manager auto-renew the certificate before it expired?",
+    "expected_answer": "The istiod-webhook-cert TLS certificate expired at 03:45 UTC on Nov 19 2026 — 5 minutes before the Istio upgrade completed. Cert-manager failed to auto-renew it because its Vault ClusterIssuer used an expired Vault token (90-day TTL, last renewed August 2026). When cert-manager attempted renewal on October 20, 2026, Vault authentication failed silently with 'permission denied', and the renewal was never retried due to missing retry logic in the cert-manager controller configuration.",
+    "expected_sources": ["INC-2026-092-istio-sidecar-injection-failure-after-control-plane-upgrade.md"],
+    "category": "incident",
+    "difficulty": "medium"
+  },
+  {
+    "id": "INC-05",
+    "question": "In INC-2022-004, why did the canary-deployer auto-promote cron-dispatcher v2.14.1 to production despite the elevated error rate?",
+    "expected_answer": "The canary-deployer's MetricsCollector failed to fetch error rate data from Prometheus during the 5-minute observation window due to query timeouts. The code defaulted errorRate to nil when Prometheus queries failed and the promotion logic treated nil as '0% errors' (i.e. healthy) rather than 'unable to determine health'. This is a fail-unsafe pattern: the system assumed health when it lacked information to make a determination, so it promoted v2.14.1 to 100% of traffic despite a 6.7% canary error rate.",
+    "expected_sources": ["INC-2022-004-canary-deployment-auto-promoted-despite-elevated-error-rate.md"],
+    "category": "incident",
+    "difficulty": "medium"
+  },
+  {
+    "id": "INC-06",
+    "question": "In INC-2023-022, why did TLS handshakes fail across the Istio service mesh even though all NovaCrest certificates were valid?",
+    "expected_answer": "AWS deployed a misconfigured network ACL change to us-east-1 VPC infrastructure at 17:03 UTC that blocked TCP port ranges used for VPC peering and inter-availability-zone traffic. This severed Istio control plane communication: the istiod / pilot-discovery service in us-east-1a couldn't reach Envoy sidecars in us-east-1b and us-east-1c. While Vault-issued certificates were valid until April 2023, Envoy proxies couldn't complete the TLS handshake because they couldn't reach pilot-discovery for certificate chain validation and SPIFFE identity verification. AWS automatically rolled back the ACL change at 17:41 UTC after their internal monitoring detected the impact.",
+    "expected_sources": ["INC-2023-022-multi-region-failover-triggered-by-us-east-1-networking-issue.md"],
+    "category": "incident",
+    "difficulty": "hard"
+  },
+  {
+    "id": "INC-07",
+    "question": "In INC-2025-080, what specific code change introduced the WebSocket session memory leak, and what was the leak rate that allowed it to go undetected for 72 hours?",
+    "expected_answer": "PR #2847 refactored session creation in session-store v1.14.3 and introduced a new function createSessionWithoutTTL() intended for short-lived temporary sessions during the WebSocket handshake phase. This function was incorrectly called in the main WebSocket session establishment path (pkg/session/websocket.go:147) instead of the standard createSession() function, so WebSocket sessions were created with TTL=-1 (permanent) in both Redis and Memcached, ignoring SESSION_TTL_SEC. The leak rate was approximately 240 sessions per hour, well below the typical daily session churn of ~80k sessions — slow enough that the linear growth didn't trigger immediate alerts.",
+    "expected_sources": ["INC-2025-080-session-store-memory-leak-detected-over-72-hours.md"],
     "category": "incident",
     "difficulty": "hard"
   },
   {
     "id": "RUN-01",
-    "question": "What is the P99 latency alert threshold for the API gateway?",
-    "expected_answer": "The P99 latency alert threshold is >2000ms for more than 5 minutes.",
-    "expected_sources": ["api-gateway-high-latency-troubleshooting.md"],
+    "question": "In the auth-service JWT key rotation procedure, what is the duration of the key overlap window during a scheduled rotation, and how do the old and new keys behave during that window?",
+    "expected_answer": "The overlap window is 120 minutes (2 hours). During this window, both keys are active: the OLD key validates existing tokens only (no new token signing), while the NEW key signs all new tokens AND validates.",
+    "expected_sources": ["auth-service-jwt-key-rotation-procedure.md"],
     "category": "runbook",
     "difficulty": "easy"
   },
   {
     "id": "RUN-02",
-    "question": "What framework and language is the API gateway written in, and what are its HPA scaling limits?",
-    "expected_answer": "The API gateway is written in Go 1.22 using the chi router framework. HPA scales between 4 and 20 pods.",
-    "expected_sources": ["api-gateway-high-latency-troubleshooting.md"],
+    "question": "According to the alert-engine alert storm mitigation runbook, what alert volume thresholds define an alert storm, and what is the normal alert evaluation rate?",
+    "expected_answer": "An alert storm is defined as more than 50,000 alerts firing within a 5-minute window, or more than 500 notifications sent per minute. During normal operations, alert-engine processes approximately 2,000-5,000 alert evaluations per minute.",
+    "expected_sources": ["alert-engine-alert-storm-mitigation.md"],
+    "category": "runbook",
+    "difficulty": "easy"
+  },
+  {
+    "id": "RUN-03",
+    "question": "In the rate-limiter Redis failover runbook, what is the typical failover window duration, and what is the fallback behavior when rate-limiter becomes unavailable?",
+    "expected_answer": "The typical failover window is 10-45 seconds, during which customers may see unexpected 429 responses or temporary lifting of limits. When rate-limiter becomes unavailable, the api-gateway falls back to local in-memory rate limiting, which is non-distributed and less accurate than the distributed token bucket state.",
+    "expected_sources": ["rate-limiter-rate-limit-redis-failover.md"],
     "category": "runbook",
     "difficulty": "medium"
   },
   {
-    "id": "RUN-03",
-    "question": "What goroutine count per pod is a red flag for the API gateway and who should be escalated to if the incident lasts over 1 hour?",
-    "expected_answer": "A goroutine count >5000 per pod is a red flag. Escalate to Jennifer Liu if the incident lasts >1 hour or reaches P1 severity.",
-    "expected_sources": ["api-gateway-high-latency-troubleshooting.md"],
+    "id": "RUN-04",
+    "question": "What is the billing-service payment retry schedule, and what happens to an account after the maximum number of retries fails?",
+    "expected_answer": "Payment retries use exponential backoff at 1 hour, 6 hours, 24 hours, and 72 hours. After 4 failed attempts, the account moves to 'payment_failed' state and triggers a customer notification.",
+    "expected_sources": ["billing-service-payment-failure-handling.md"],
+    "category": "runbook",
+    "difficulty": "medium"
+  },
+  {
+    "id": "RUN-05",
+    "question": "In the log-processor consumer-lag remediation runbook, what are the estimated recovery times for different lag levels, and what processing rate do they assume?",
+    "expected_answer": "The estimates assume the lag decreases at greater than 10,000 messages per second. At that rate: 500K messages of lag takes approximately 1 minute to recover; 5M messages takes about 8 minutes; 50M messages takes about 80 minutes.",
+    "expected_sources": ["log-processor-consumer-lag-remediation.md"],
+    "category": "runbook",
+    "difficulty": "medium"
+  },
+  {
+    "id": "RUN-06",
+    "question": "In the query-engine ClickHouse memory tuning runbook, what is the recommended per-query and per-user memory limit configuration, and how is the change applied without restarting ClickHouse?",
+    "expected_answer": "Increase max_memory_usage (per-query limit) to 15GB (15000000000 bytes) and add a per-user limit max_memory_usage_for_user of 40GB (40000000000 bytes) to prevent tenant abuse, with max_execution_time=30 in the default profile. The settings live in /etc/clickhouse-server/users.d/memory_limits.xml. After editing, run `sudo systemctl reload clickhouse-server` — no restart is required.",
+    "expected_sources": ["query-engine-clickhouse-memory-limit-tuning.md"],
     "category": "runbook",
     "difficulty": "hard"
   },
   {
-    "id": "ARCH-01",
-    "question": "How many metrics per minute does the NovaCrest Insights Platform process?",
-    "expected_answer": "2.8 billion metrics per minute.",
-    "expected_sources": ["architecture-architecture-overview-novacrest-insights-platform.md"],
-    "category": "architecture",
+    "id": "RUN-07",
+    "question": "In the auth-service emergency JWT key rotation procedure (for a compromised key), what trade-off does emergency rotation make compared to scheduled rotation, and what are the immediate steps required to revoke active tokens and force re-authentication?",
+    "expected_answer": "Emergency rotation skips the 120-minute overlap window and causes brief authentication outages of 30-60 seconds. Immediate steps: (1) Revoke all active tokens by setting a global token revocation flag in Redis: `SET auth:global_revoke <timestamp> EX 7200`. (2) Generate a new key in Vault and set it directly as the current key (no overlap), then run a rolling restart of the auth-service deployment. (3) Force client re-authentication by flushing the session-store Redis (`FLUSHDB`) and clearing the API key cache (`DEL auth:apikeys:*`).",
+    "expected_sources": ["auth-service-jwt-key-rotation-procedure.md"],
+    "category": "runbook",
+    "difficulty": "hard"
+  },
+  {
+    "id": "PLAY-01",
+    "question": "In the multi-region failover playbook, what is the expected customer-facing downtime during the failover, and what is the maximum potential data loss?",
+    "expected_answer": "3-5 minutes of customer-facing downtime during DNS propagation. Potential data loss is the last 30-60 seconds of ingested telemetry, due to Kafka cross-region replication lag.",
+    "expected_sources": ["dr-multi-region-failover-procedure.md"],
+    "category": "playbook",
     "difficulty": "easy"
   },
   {
-    "id": "ARCH-02",
-    "question": "How many Kafka brokers does NovaCrest run and how many partitions does the metrics.raw topic have?",
-    "expected_answer": "6 Kafka brokers (m5.4xlarge) across 3 availability zones. The metrics.raw topic has 48 partitions with 72-hour retention.",
-    "expected_sources": ["architecture-architecture-overview-novacrest-insights-platform.md"],
-    "category": "architecture",
+    "id": "PLAY-02",
+    "question": "What Shamir threshold is used for unsealing Vault at NovaCrest, and who are the designated key holders?",
+    "expected_answer": "Vault uses Shamir secret sharing with a 3-of-5 threshold — 3 unseal keys required out of 5 total shares. NovaCrest has 5 designated key holders: Aisha Nakamura (security-engineering lead), Michael Foster (security-engineering manager), Derek Chen (SRE staff engineer), Priya Deshmukh (platform-engineering director), and James Morrison (CTO, break-glass only).",
+    "expected_sources": ["security-vault-unseal-procedure.md"],
+    "category": "playbook",
+    "difficulty": "easy"
+  },
+  {
+    "id": "PLAY-03",
+    "question": "In the Multi-Region Failover playbook, what threshold must Kafka cross-region replication lag be under before initiating failover, and how does the playbook track active connection drain progress?",
+    "expected_answer": "Kafka replication lag must be under 60 seconds before initiating failover. Connection drain progress is tracked by watching the edge-proxy Envoy statistic `downstream_cx_active`; the team waits until that count drops below 10 (typically 90-120 seconds).",
+    "expected_sources": ["dr-multi-region-failover-procedure.md"],
+    "category": "playbook",
     "difficulty": "medium"
   },
   {
-    "id": "ARCH-03",
-    "question": "What is the P99 latency for the metrics processing pipeline from ingestion to ClickHouse write?",
-    "expected_answer": "The P99 latency is 285ms for the metrics-processor pipeline from ingestion to ClickHouse write.",
-    "expected_sources": ["architecture-architecture-overview-novacrest-insights-platform.md"],
-    "category": "architecture",
+    "id": "PLAY-04",
+    "question": "In the PostgreSQL major version upgrade playbook, what is the upgrade strategy, what is the source and target version, and what is the estimated duration per database?",
+    "expected_answer": "The strategy is Aurora Blue/Green deployment, which allows zero-downtime upgrade with quick rollback if issues are detected. Current version is PostgreSQL 15.4 and target is 16.2 (latest stable). Estimated duration is 4-6 hours per database.",
+    "expected_sources": ["database-postgresql-major-version-upgrade.md"],
+    "category": "playbook",
     "difficulty": "medium"
+  },
+  {
+    "id": "PLAY-05",
+    "question": "In the Kubernetes cluster upgrade playbook, what cluster upgrade order is followed, what is the standard maintenance window, and what is the size of each production cluster?",
+    "expected_answer": "The upgrade order is dev → staging → prod → prod-eu. The standard maintenance window is Saturday 02:00-08:00 UTC, with customer notifications required 72 hours in advance. The prod cluster (us-east-1) operates 187 nodes across 6 node groups; prod-eu (eu-west-1) operates 94 nodes across 4 node groups.",
+    "expected_sources": ["maintenance-kubernetes-cluster-upgrade-procedure.md"],
+    "category": "playbook",
+    "difficulty": "medium"
+  },
+  {
+    "id": "PLAY-06",
+    "question": "In the Vault unseal playbook, what should be done if a cluster split-brain (multiple leaders) is detected after unsealing, and what is the unseal-key inactivity timeout if the operator enters incorrect keys?",
+    "expected_answer": "If split-brain is detected, the operator should: (1) seal all nodes immediately by port-forwarding to each (vault-0, vault-1, vault-2) in turn and running `vault operator seal`; (2) delete all vault pods (`kubectl delete pod -n vault-system -l app=vault`) to force a clean restart; (3) wait for the pods to restart in the sealed state and then re-unseal following the standard procedure. Unseal keys reset automatically after 10 minutes of inactivity, so a failed or incorrect unseal attempt clears itself within that window.",
+    "expected_sources": ["security-vault-unseal-procedure.md"],
+    "category": "playbook",
+    "difficulty": "hard"
   },
   {
     "id": "K8S-01",
-    "question": "What are the CPU and memory resource limits for the API gateway Kubernetes deployment?",
-    "expected_answer": "CPU: 500m request / 2000m limit. Memory: 512Mi request / 2Gi limit.",
-    "expected_sources": ["api-gateway.yaml"],
+    "question": "What are the CPU and memory resource requests and limits configured for the auth-service deployment?",
+    "expected_answer": "CPU: 250m request, 1000m limit. Memory: 256Mi request, 1Gi limit.",
+    "expected_sources": ["auth-service.yaml"],
     "category": "kubernetes",
     "difficulty": "easy"
   },
   {
     "id": "K8S-02",
-    "question": "What is the liveness probe configuration for the API gateway pods?",
-    "expected_answer": "Liveness probe: HTTP GET /healthz on port 8080, initialDelaySeconds 15, periodSeconds 10, timeoutSeconds 3, failureThreshold 3.",
-    "expected_sources": ["api-gateway.yaml"],
+    "question": "What are the HPA min and max replica counts for the ingest-service, and what metric drives autoscaling?",
+    "expected_answer": "minReplicas 6, maxReplicas 30. The HPA scales based on CPU utilization with a target of 65% averageUtilization.",
+    "expected_sources": ["ingest-service.yaml"],
+    "category": "kubernetes",
+    "difficulty": "easy"
+  },
+  {
+    "id": "K8S-03",
+    "question": "What PodDisruptionBudget policy is applied across NovaCrest's tier-1 services in the pod-disruption-budgets.yaml file, and which namespaces does that file span?",
+    "expected_answer": "Every PDB sets minAvailable: 50%, ensuring at least half of each service's pods stay available during voluntary disruptions. The PDBs span four namespaces: core (api-gateway, auth-service, rate-limiter, tenant-manager, billing-service), data (ingest-service, query-engine, metrics-aggregator), monitoring (alert-engine), and istio-system (edge-proxy).",
+    "expected_sources": ["pod-disruption-budgets.yaml"],
     "category": "kubernetes",
     "difficulty": "medium"
   },
   {
-    "id": "K8S-03",
-    "question": "What is the HPA target CPU utilization for the API gateway and what anti-affinity rule is configured?",
-    "expected_answer": "HPA targets 70% CPU utilization. Anti-affinity: preferredDuringSchedulingIgnoredDuringExecution with weight 100 on kubernetes.io/hostname to spread pods across nodes.",
-    "expected_sources": ["api-gateway.yaml"],
+    "id": "K8S-04",
+    "question": "What pod anti-affinity rule does the auth-service deployment use, and what container ports does it expose?",
+    "expected_answer": "Pod anti-affinity uses preferredDuringSchedulingIgnoredDuringExecution with weight 100 on topologyKey kubernetes.io/hostname, matching label app=auth-service — preferring to spread auth-service pods across distinct nodes. The container exposes two ports: 8081 (http) and 9091 (metrics).",
+    "expected_sources": ["auth-service.yaml"],
+    "category": "kubernetes",
+    "difficulty": "medium"
+  },
+  {
+    "id": "K8S-05",
+    "question": "In the network-policies.yaml file, what default-deny policy is applied per namespace, and what cross-namespace exception is consistently allowed for monitoring?",
+    "expected_answer": "The file applies a default-deny-ingress-<ns> NetworkPolicy to each of 8 namespaces (core, data, monitoring, security, ml, istio-system, cache, argocd) with `podSelector: {}` (matching every pod) and policyTypes [Ingress]. Every namespace also has an allow-same-namespace-<ns> policy permitting ingress from pods labeled with that namespace name. The consistent cross-namespace exception is an allow-monitoring-scrape-<ns> policy in 7 of the 8 namespaces (all except monitoring itself) that permits ingress from namespaces labeled name=monitoring on TCP port 9090, letting Prometheus scrape pods across namespaces.",
+    "expected_sources": ["network-policies.yaml"],
+    "category": "kubernetes",
+    "difficulty": "medium"
+  },
+  {
+    "id": "K8S-06",
+    "question": "Compare the resource limits and HPA min/max replica counts of the ingest-service deployment versus the auth-service deployment. What does the difference imply about their roles?",
+    "expected_answer": "ingest-service: 8 base replicas, HPA min 6 / max 30, per-pod requests 1000m CPU / 1Gi memory and limits 4000m CPU / 4Gi memory. auth-service: 4 base replicas, HPA min 3 / max 12, per-pod requests 250m CPU / 256Mi memory and limits 1000m CPU / 1Gi memory. ingest-service has a 4x higher CPU limit per pod and a substantially higher HPA ceiling (30 vs 12), reflecting its role as the data-ingestion hot path (Kafka / ClickHouse / S3 writes) handling sustained high-volume telemetry, while auth-service handles smaller, request-scoped JWT/OAuth lookups.",
+    "expected_sources": ["ingest-service.yaml", "auth-service.yaml"],
     "category": "kubernetes",
     "difficulty": "hard"
   },
   {
     "id": "TF-01",
-    "question": "What are the EKS cluster names used in NovaCrest's production Terraform configuration?",
-    "expected_answer": "nova-prod-east (production), nova-prod-eu (production EU), and nova-staging (staging).",
-    "expected_sources": ["eks.tf.json"],
+    "question": "In the MSK Terraform configuration, what Kafka version, broker count, instance type, and storage volume size are configured for the production cluster?",
+    "expected_answer": "Kafka version 3.6, 6 broker nodes, instance type kafka.m5.2xlarge, and 1000 GB EBS storage per broker. The cluster name is novacrest-kafka-prod.",
+    "expected_sources": ["msk.tf.json"],
     "category": "terraform",
     "difficulty": "easy"
   },
   {
     "id": "TF-02",
-    "question": "Is the EKS production cluster publicly accessible and what encryption is configured?",
-    "expected_answer": "No, endpoint_public_access is false for production and production-eu clusters. KMS encryption is configured for secrets.",
-    "expected_sources": ["eks.tf.json"],
+    "question": "What public-facing DNS records does the Route53 Terraform configuration define for the novacrest.io zone?",
+    "expected_answer": "Four public records on the novacrest.io zone: api.novacrest.io (A alias to the external ALB), app.novacrest.io (A alias to the external ALB), status.novacrest.io (CNAME to statuspage.io with TTL 300), and cdn.novacrest.io (A alias to the CloudFront distribution).",
+    "expected_sources": ["route53.tf.json"],
+    "category": "terraform",
+    "difficulty": "easy"
+  },
+  {
+    "id": "TF-03",
+    "question": "What four WAF rules are configured for the NovaCrest CDN, and what aggregate rate-limit threshold and aggregation key are used for the rate-limit rule?",
+    "expected_answer": "Four rules in priority order: (1) AWSManagedRulesCommonRuleSet, (2) AWSManagedRulesKnownBadInputsRuleSet, (3) AWSManagedRulesSQLiRuleSet, (4) RateLimitRule. The first three are managed-rule-group statements with override_action=none. The RateLimitRule has action=block, with a rate_based_statement of limit=2000 aggregated by aggregate_key_type=IP.",
+    "expected_sources": ["waf.tf.json"],
     "category": "terraform",
     "difficulty": "medium"
   },
   {
+    "id": "TF-04",
+    "question": "What is the difference in subnet placement, internal/external visibility, and TLS listener configuration between the external_alb and internal_alb in the ALB Terraform configuration?",
+    "expected_answer": "external_alb: internal=false, placed in 3 public subnets (prod_public_a/b/c), terminates HTTPS on port 443 with TLS policy ELBSecurityPolicy-TLS13-1-2-2021-06, plus a port-80 listener that redirects HTTP→HTTPS with status_code HTTP_301. internal_alb: internal=true, placed in 3 private app subnets (prod_private_app_a/b/c), terminates HTTPS on port 443 with the same TLS policy but uses a different ACM certificate (internal-cert), and has no HTTP→HTTPS redirect listener. Both ALBs have enable_deletion_protection=true, idle_timeout=60, and access logs to bucket novacrest-log-archive-prod with their respective prefixes.",
+    "expected_sources": ["alb.tf.json"],
+    "category": "terraform",
+    "difficulty": "medium"
+  },
+  {
+    "id": "TF-05",
+    "question": "What server-level Kafka properties does the MSK configuration enforce, and what is the encryption posture in transit and at rest?",
+    "expected_answer": "The aws_msk_configuration resource sets server_properties: auto.create.topics.enable=false, default.replication.factor=3, min.insync.replicas=2, num.partitions=12, log.retention.hours=168, log.segment.bytes=1073741824 (1 GiB). Encryption: client_broker=TLS in transit, in_cluster=true between brokers, encryption_at_rest_kms_key_arn references the aws_kms_key.msk KMS key.",
+    "expected_sources": ["msk.tf.json"],
+    "category": "terraform",
+    "difficulty": "medium"
+  },
+  {
+    "id": "TF-06",
+    "question": "In the Route53 Terraform configuration, what is the difference between the public and internal zones, and what is the only record stored in the internal zone? How does it differ in alias target from the equivalent public records?",
+    "expected_answer": "The public zone hosts novacrest.io and is not associated with a VPC, so it is resolvable from the public internet. The internal zone hosts novacrest.internal and is bound to ${aws_vpc.vpc_prod.id}, making it a private hosted zone resolvable only within that VPC. The internal zone contains exactly one A record: grafana.novacrest.internal, aliased to ${aws_lb.internal.dns_name} / ${aws_lb.internal.zone_id} (the internal_alb). The public records (api, app, cdn) instead point to either the external_alb or the CloudFront distribution.",
+    "expected_sources": ["route53.tf.json"],
+    "category": "terraform",
+    "difficulty": "hard"
+  },
+  {
+    "id": "PUPPET-01",
+    "question": "In the NovaCrest Puppetfile, what version of puppetlabs-stdlib is pinned, and what is the source for the internal novacrest-base module?",
+    "expected_answer": "puppetlabs-stdlib is pinned to version 9.4.1. The novacrest-base module is sourced from the internal Git repository at git@github.com:novacrest/puppet-base.git, branch main.",
+    "expected_sources": ["Puppetfile"],
+    "category": "puppet",
+    "difficulty": "easy"
+  },
+  {
+    "id": "PUPPET-02",
+    "question": "What is the Hiera 5 hierarchy lookup order configured in hiera.yaml, and what backend supplies secrets?",
+    "expected_answer": "Hiera 5 hierarchy in order: (1) Per-node data at `nodes/%{::trusted.certname}.yaml`, (2) Per-role data at `roles/%{::role}.yaml`, (3) Per-environment data at `environment/%{::environment}.yaml`, (4) Common data at `common.yaml`, (5) Secrets from Vault via the `hiera_vault` lookup_key plugin, mounting `secret/puppet/%{::trusted.certname}` and `secret/puppet/common` from https://vault.novacrest.internal:8200.",
+    "expected_sources": ["hiera.yaml"],
+    "category": "puppet",
+    "difficulty": "easy"
+  },
+  {
+    "id": "PUPPET-03",
+    "question": "What sub-classes does the postgresql_server class contain, in what order are they applied, and why does the module note say production isn't managed by it?",
+    "expected_answer": "Five sub-classes: postgresql_server::server, postgresql_server::config, postgresql_server::databases, postgresql_server::users, postgresql_server::backup — all included via `contain`. They are explicitly ordered server → config → users → databases → backup using Puppet `->` resource arrows. The header comment says the module is for dev/staging self-hosted instances; production uses Aurora (managed via Terraform).",
+    "expected_sources": ["postgresql_server/manifests/init.pp"],
+    "category": "puppet",
+    "difficulty": "medium"
+  },
+  {
+    "id": "PUPPET-04",
+    "question": "What feature flags does the security_baseline class accept, what are their defaults, and what compliance baseline does the module implement?",
+    "expected_answer": "Five Boolean parameters, all defaulting to true: enable_cis_os, enable_cis_ssh, enable_cis_audit, enable_falco, enable_ossec. The module implements CIS Benchmark Level 1 plus NovaCrest-specific hardening, is applied to all nodes, and is audited quarterly by security-engineering.",
+    "expected_sources": ["security_baseline/manifests/init.pp"],
+    "category": "puppet",
+    "difficulty": "medium"
+  },
+  {
+    "id": "PUPPET-05",
+    "question": "What default Kafka broker tuning parameters does the kafka_broker class set, and what production deployment does the module note say it doesn't manage?",
+    "expected_answer": "Defaults: version=3.6.1, scala_version=2.13, log_dirs=/var/lib/kafka/data, num_partitions=12, default_replication_factor=3, min_insync_replicas=2, heap_size=6g, port=9092. broker_id pulls from the $::kafka_broker_id fact. zookeeper_connect points to zk-0/zk-1/zk-2.zk.data.svc:2181 with chroot /kafka. The header notes production uses AWS MSK (managed via Terraform), so this module covers only dev/staging self-hosted clusters.",
+    "expected_sources": ["kafka_broker/manifests/init.pp"],
+    "category": "puppet",
+    "difficulty": "medium"
+  },
+  {
+    "id": "PUPPET-06",
+    "question": "Compare the orchestration pattern of the postgresql_server and kafka_broker modules: how do they each contain their submodules, what dependency ordering do they enforce, and what production-vs-dev split do both modules share in their header comments?",
+    "expected_answer": "Both modules use the same containment-plus-ordering pattern. postgresql_server contains five sub-classes (postgresql_server::server, ::config, ::users, ::databases, ::backup) with explicit ordering server → config → users → databases → backup via the `->` resource arrows. kafka_broker contains four sub-classes (kafka_broker::install, ::broker_config, ::topics, ::monitoring) with ordering install → broker_config → topics → monitoring. Both use Puppet's `contain` to ensure refresh/notify events propagate, and chained `->` arrows for explicit dependency. Both header comments declare the same production-vs-dev split: production uses a managed AWS service (Aurora for postgres, MSK for kafka, both via Terraform), while these Puppet modules apply only to dev/staging self-hosted instances.",
+    "expected_sources": ["postgresql_server/manifests/init.pp", "kafka_broker/manifests/init.pp"],
+    "category": "puppet",
+    "difficulty": "hard"
+  },
+  {
     "id": "CMDB-01",
-    "question": "What port does the ingest-service run on and what language is it written in?",
-    "expected_answer": "The ingest-service runs on port 8090 and is written in Rust.",
+    "question": "What is the technology, port, and tier of the ingest-service in cmdb-production.csv, and which team owns it?",
+    "expected_answer": "Technology: rust. Port: 8090. Tier: 1 (critical). Owned by data-engineering. Status: operational. Owner email: priya.patel@novacrest.io.",
     "expected_sources": ["cmdb-production.csv"],
     "category": "cmdb",
     "difficulty": "easy"
   },
   {
     "id": "CMDB-02",
-    "question": "Which services in the CMDB have a degraded status?",
-    "expected_answer": "The api-gateway and etl-worker have degraded status.",
+    "question": "What is the criticality and team for the cert-manager-controller in the CMDB, and what is described as the #1 preventable outage cause?",
+    "expected_answer": "Criticality: high. Team: security-engineering. The CMDB description for cert-manager-controller states cert expiry is the #1 preventable outage cause. The service auto-renews certificates from Let's Encrypt (external) and Vault PKI (internal). Owner: aisha.nakamura@novacrest.io.",
     "expected_sources": ["cmdb-production.csv"],
     "category": "cmdb",
-    "difficulty": "medium"
+    "difficulty": "easy"
   },
   {
     "id": "CMDB-03",
-    "question": "Who is the owner of the api-gateway service and what team manages it?",
-    "expected_answer": "The api-gateway is owned by marcus.williams@novacrest.io and managed by the backend-services team.",
+    "question": "What does api-gateway depend_on per the CMDB, what does it support, and what is its current status?",
+    "expected_answer": "api-gateway depends on auth-service, rate-limiter, and redis-session. It supports edge-proxy. Current status: degraded. Tier 1 (critical). Technology: go. Owner: marcus.williams@novacrest.io.",
     "expected_sources": ["cmdb-production.csv"],
     "category": "cmdb",
-    "difficulty": "easy"
-  },
-  {
-    "id": "PLAY-01",
-    "question": "How much raw storage does NovaCrest's ClickHouse cluster currently hold?",
-    "expected_answer": "340TB of raw storage across 3 shards with 2 replicas each.",
-    "expected_sources": ["capacity-clickhouse-storage-capacity-planning.md"],
-    "category": "playbook",
-    "difficulty": "easy"
-  },
-  {
-    "id": "PLAY-02",
-    "question": "Who needs to approve the ClickHouse storage capacity planning procedure?",
-    "expected_answer": "Priya Patel (owner lead), David Nakamura (manager), and the Infrastructure VP.",
-    "expected_sources": ["capacity-clickhouse-storage-capacity-planning.md"],
-    "category": "playbook",
     "difficulty": "medium"
   },
   {
+    "id": "CMDB-04",
+    "question": "In cmdb-databases.csv, what is the storage size, instance class, multi-AZ setting, read replica count, max_connections, and backup_retention_days for postgres-billing?",
+    "expected_answer": "postgres-billing: storage_gb=1000, instance_class=db.r6g.xlarge, multi_az=True, read_replicas=2, max_connections=150, backup_retention_days=90. Aurora engine, version 15.4.",
+    "expected_sources": ["cmdb-databases.csv"],
+    "category": "cmdb",
+    "difficulty": "medium"
+  },
+  {
+    "id": "CMDB-05",
+    "question": "What is the storage, backup retention, instance class, and policy enforcement described for postgres-audit in cmdb-databases.csv, and what compliance need drives those settings?",
+    "expected_answer": "postgres-audit (aurora 15.4): storage_gb=2000, instance_class=db.r6g.xlarge, max_connections=100, backup_retention_days=2555 (~7 years), multi_az=True, read_replicas=1. The description reads 'Immutable audit log. 7-year retention for compliance. Append-only, no deletions allowed.' Owner: aisha.nakamura@novacrest.io. The 7-year retention reflects regulatory compliance requirements for audit data.",
+    "expected_sources": ["cmdb-databases.csv"],
+    "category": "cmdb",
+    "difficulty": "hard"
+  },
+  {
     "id": "ADR-01",
-    "question": "Why did NovaCrest choose ClickHouse over TimescaleDB for metrics storage?",
-    "expected_answer": "ClickHouse achieved 143M data points/sec sustained write throughput vs TimescaleDB's 12M. ClickHouse P95 query latency was 420ms vs 2.8s. ClickHouse compression was 18.5x vs 8x. Projected annual savings of $2.9M/year.",
-    "expected_sources": ["adr-adr-001-choosing-clickhouse-over-timescaledb-for-metrics-storage.md"],
+    "question": "In ADR-005, what P95 latency target was set for the Rust ingest service rewrite, and what P95 was the existing Go implementation hitting?",
+    "expected_answer": "The target was sub-20ms P95 latency. The existing Go metric-ingestor was hitting 45ms P95 in us-east-1 production. The 99th percentile was spiking to 180ms during GC pauses in the telemetry-gateway.",
+    "expected_sources": ["adr-adr-005-rust-for-ingest-service-vs-go.md"],
+    "category": "adr",
+    "difficulty": "easy"
+  },
+  {
+    "id": "ADR-02",
+    "question": "What decision did ADR-009 make for tenant configuration storage, and which data classes remain in PostgreSQL?",
+    "expected_answer": "ADR-009 decided to migrate tenant configuration data to Amazon DynamoDB with DynamoDB Global Tables for multi-region replication. The primary table is novacrest-tenant-configs-prod and the secondary table is novacrest-tenant-features-prod. The following remain in PostgreSQL: tenant billing data (requires ACID transactions with invoices), audit logs (requires complex relational queries), and user management (authentication still uses auth-service PostgreSQL).",
+    "expected_sources": ["adr-adr-009-dynamodb-for-tenant-config-vs-postgresql.md"],
+    "category": "adr",
+    "difficulty": "easy"
+  },
+  {
+    "id": "ADR-03",
+    "question": "In ADR-005's Rust rewrite plan for the ingest service, what specific libraries are chosen for HTTP, Kafka, and JSON parsing, and what allocator is selected?",
+    "expected_answer": "actix-web 4.x for the HTTP API (with tokio async runtime), rdkafka for Kafka integration, and serde + simd-json for zero-copy deserialization. Inter-service communication uses Proto3 with prost. The custom memory pool allocator is jemalloc.",
+    "expected_sources": ["adr-adr-005-rust-for-ingest-service-vs-go.md"],
     "category": "adr",
     "difficulty": "medium"
   },
   {
-    "id": "ADR-02",
-    "question": "What is the ClickHouse cluster configuration and sharding key decided in ADR-001?",
-    "expected_answer": "3 shards, 2 replicas, 18 nodes total (m5.4xlarge: 16 vCPU, 64GB RAM, 8TB NVMe per node). Sharding key: sipHash64(customer_id, metric_name).",
-    "expected_sources": ["adr-adr-001-choosing-clickhouse-over-timescaledb-for-metrics-storage.md"],
+    "id": "ADR-04",
+    "question": "In ADR-013, what migration path was decided for Kafka, what is the timeline, and what cost savings and throughput improvement are projected?",
+    "expected_answer": "ADR-013 decided to migrate from Amazon MSK to self-hosted Kafka on EKS using the Strimzi Operator, with a Q2 2024 (April-June) timeline. Projected outcomes: 35% cost savings over 3 years (approximately $310K saved), 15-20% throughput increase from JVM tuning, full control over configuration/scaling/upgrades, better alignment with Kubernetes-centric infrastructure, improved observability via direct Prometheus integration, and elimination of MirrorMaker overhead for multi-region replication.",
+    "expected_sources": ["adr-adr-013-kafka-msk-vs-self-hosted-kafka.md"],
+    "category": "adr",
+    "difficulty": "medium"
+  },
+  {
+    "id": "ADR-05",
+    "question": "In ADR-015, what five concrete requirements drive the choice between Prometheus Federation and Thanos, and what compliance citation justifies the long-term retention requirement?",
+    "expected_answer": "Five requirements: (1) global query interface — single pane of glass to query metrics across all clusters without context switching, (2) long-term storage retaining metrics for 13 months, (3) high availability surviving single-cluster failures during query time, (4) cost efficiency holding the increase under 20% over the current $3,200/month EBS storage cost, (5) historical analysis supporting capacity planning queries spanning 6+ months. The 13-month retention requirement is driven by a SOC2 audit (audit ID NC-8472).",
+    "expected_sources": ["adr-adr-015-prometheus-federation-vs-thanos.md"],
+    "category": "adr",
+    "difficulty": "medium"
+  },
+  {
+    "id": "ADR-06",
+    "question": "In ADR-009, what specific PostgreSQL pain points justified the move to DynamoDB, and what was the projected monthly cost of staying on Postgres versus migrating?",
+    "expected_answer": "PostgreSQL pain points: 45,000+ reads/sec at peak with P99 read latency at 85ms (target <10ms); 6 microservices maintain independent Redis caches with TTLs ranging 30s-300s causing stale reads and inconsistency; 14 related tables with foreign-key constraints make schema migrations slow; cross-region prod-eu latency is 80-120ms when reading from us-east-1 Aurora; Aurora read replicas lag 2-5 seconds during high write periods. Cost comparison: staying on PostgreSQL (Option 1) projects $28,000/month for Aurora plus $3,200/month for ElastiCache Redis, totaling $31,200/month.",
+    "expected_sources": ["adr-adr-009-dynamodb-for-tenant-config-vs-postgresql.md"],
     "category": "adr",
     "difficulty": "hard"
   },
   {
-    "id": "ADR-03",
-    "question": "What was the projected monthly cost savings of switching from TimescaleDB to ClickHouse?",
-    "expected_answer": "ClickHouse projected at $98K/month vs TimescaleDB at $187K/month for storage, saving approximately $242K/month or $2.9M/year.",
-    "expected_sources": ["adr-adr-001-choosing-clickhouse-over-timescaledb-for-metrics-storage.md"],
-    "category": "adr",
-    "difficulty": "medium"
-  },
-  {
-    "id": "PUPPET-01",
-    "question": "What is the dependency chain order in the Puppet base module?",
-    "expected_answer": "ntp -> ssh -> users -> sudoers -> firewall_base -> rsyslog -> logrotate -> motd",
-    "expected_sources": ["init.pp"],
-    "category": "puppet",
-    "difficulty": "medium"
-  },
-  {
-    "id": "PUPPET-02",
-    "question": "What boolean parameters does the Puppet base class accept?",
-    "expected_answer": "manage_ntp, manage_ssh, manage_users, manage_firewall, manage_syslog (all Boolean, all default true).",
-    "expected_sources": ["init.pp"],
-    "category": "puppet",
+    "id": "ARCH-01",
+    "question": "In the data pipeline architecture doc, what is NovaCrest's peak ingestion rate, daily data volume, and end-to-end pipeline latency target?",
+    "expected_answer": "Peak ingestion is 2.8 million events/second. Daily volume is 180TB raw, 45TB stored after compression. P95 end-to-end latency from ingestion to queryable is 1.2 seconds. Average compression ratio is 4.2:1.",
+    "expected_sources": ["architecture-data-pipeline-architecture-ingestion-to-clickhouse.md"],
+    "category": "architecture",
     "difficulty": "easy"
   },
   {
+    "id": "ARCH-02",
+    "question": "In the edge architecture, what three CloudFront cache behaviors are configured, and what is the TTL for static assets, API requests, and the frontend application?",
+    "expected_answer": "Three CloudFront cache behaviors: (1) Static Assets (paths /static/* and /assets/*) with TTL 86400 seconds (24 hours), origin S3 bucket novacrest-static-assets-prod, CachingOptimized cache policy. (2) API Requests (paths /api/v1/* and /api/v2/*) with TTL 0 seconds (no caching by default), origin the prod ALB, custom cache policy NovaCrestAPIPolicy. (3) Frontend Application (path /*) with TTL 300 seconds (5 minutes) for HTML, custom NovaCrestAppPolicy.",
+    "expected_sources": ["architecture-edge-architecture-cloudfront-istio-ingress-api-gateway.md"],
+    "category": "architecture",
+    "difficulty": "easy"
+  },
+  {
+    "id": "ARCH-03",
+    "question": "In the multi-tenancy architecture, what tenant ID format is used, what three mechanisms can carry tenant context per request, and how is tenant metadata cached?",
+    "expected_answer": "Tenant IDs follow the format `tn-{environment}-{8-char-alphanumeric}` (example: tn-prod-a7f3k9m2). Three context-carrying mechanisms: (1) JWT tokens issued by auth-service include a `tenant_id` claim, (2) Customer-specific subdomains such as acme-corp.novacrest.io resolved by ingress-controller with Istio VirtualService routing, (3) Legacy API Key Headers via `X-NovaCrest-Tenant-ID` with API key validation in api-gateway. The tenant registry is backed by an Aurora PostgreSQL database (tenant-registry-db) with read replicas in each availability zone; api-gateway caches tenant metadata in Redis (tenant-cache ElastiCache cluster, 6 nodes) with a 5-minute TTL to minimize database load.",
+    "expected_sources": ["architecture-multi-tenancy-architecture-and-data-isolation.md"],
+    "category": "architecture",
+    "difficulty": "medium"
+  },
+  {
+    "id": "ARCH-04",
+    "question": "In the authentication/authorization architecture, what is the difference in role between auth-service and permissions-service, what infrastructure is each deployed on, and what permission-model format does permissions-service use?",
+    "expected_answer": "auth-service is the central identity provider built on OAuth 2.0 / OpenID Connect (OIDC). Responsibilities include user authentication (email/password, SSO, SAML), OAuth2 flows, JWT token issuance and validation, session management, MFA (TOTP, WebAuthn), API key generation and validation, and customer tenant isolation. Deployed on EKS with 12 replicas across 3 availability zones, backed by PostgreSQL Aurora cluster auth-db. permissions-service is the authorization service implementing fine-grained RBAC plus attribute-based access control (ABAC), evaluating policies and returning permit/deny decisions. Deployed on EKS with 8 replicas, backed by Aurora permissions-db with Redis cache permissions-cache. Permission model format: `resource:action:scope` — e.g., `dashboard:read:tenant:acme-corp`, `alert:write:tenant:acme-corp:team:sre`, `user:delete:tenant:*:role:admin`.",
+    "expected_sources": ["architecture-authentication-and-authorization-architecture.md"],
+    "category": "architecture",
+    "difficulty": "medium"
+  },
+  {
+    "id": "ARCH-05",
+    "question": "In the data pipeline architecture, what Kafka topic structure carries raw vs processed telemetry, and what ClickHouse cluster shape stores it?",
+    "expected_answer": "Raw telemetry topics in the MSK cluster: metrics.raw (24 partitions), logs.raw (48 partitions), traces.raw (32 partitions). After processing by the Stream Processor fleet (Go, 45 pods) and Enrichment Service (Python/FastAPI, 12 pods), the processed topics are: metrics.processed, logs.processed, traces.processed. ClickHouse Inserters (Go, 18 pods per shard) write to a 3-shard × 2-replica ClickHouse cluster (clickhouse-01-a/b, clickhouse-02-a/b, clickhouse-03-a/b on novacrest.internal) using ReplicatedMergeTree engines, with TTL policies of 90 days hot storage and 1 year cold storage in S3.",
+    "expected_sources": ["architecture-data-pipeline-architecture-ingestion-to-clickhouse.md"],
+    "category": "architecture",
+    "difficulty": "medium"
+  },
+  {
+    "id": "ARCH-06",
+    "question": "In the multi-tenancy architecture doc, what tenancy model does NovaCrest use, what are the four data isolation layers, and how does Layer 1 (application-level) enforce tenant context per request?",
+    "expected_answer": "NovaCrest uses a hybrid multi-tenancy model combining shared infrastructure with logical data isolation across four layers: application, database, storage, and network. Layer 1 (Application-Level Isolation) is implemented via a `tenant_context_middleware` in every microservice that: (a) extracts tenant_id from the request; (b) raises HTTP 401 'Tenant context required' if missing; (c) validates the tenant via tenant_registry.get_tenant(tenant_id) and raises HTTP 403 'Invalid or inactive tenant' if missing or status != 'active'; (d) injects tenant_id and the tenant object into request.state; (e) binds tenant_id into the structlog context for correlated logging. The example given is from ingest-service (Python/FastAPI).",
+    "expected_sources": ["architecture-multi-tenancy-architecture-and-data-isolation.md"],
+    "category": "architecture",
+    "difficulty": "hard"
+  },
+  {
+    "id": "HELM-01",
+    "question": "In the base values.yaml, what 8 namespaces does the chart create, and what is the default minAvailable for PodDisruptionBudgets?",
+    "expected_answer": "The chart creates 8 namespaces: core, data, monitoring, security, ml, istio-system, cache, argocd. The default global PodDisruptionBudget setting is enabled=true with minAvailable=50%. Each namespace has a resourceQuota — for example, core gets cpu='100' / memory=200Gi, and data gets cpu='200' / memory=400Gi.",
+    "expected_sources": ["values.yaml"],
+    "category": "helm",
+    "difficulty": "easy"
+  },
+  {
+    "id": "HELM-02",
+    "question": "In the production overrides (values-production.yaml), what global topology spread constraints are configured, and what AWS region/account/cluster are pinned?",
+    "expected_answer": "global.topologySpreadConstraints: enabled=true, maxSkew=1, topologyKey=topology.kubernetes.io/zone, whenUnsatisfiable=DoNotSchedule. AWS region: us-east-1, accountId: '123456789012', cluster: nova-prod-east. The global PDB minAvailable stays at 50% in the global block, but several services (api-gateway, auth-service) override it to 75% per-service.",
+    "expected_sources": ["values-production.yaml"],
+    "category": "helm",
+    "difficulty": "easy"
+  },
+  {
+    "id": "HELM-03",
+    "question": "Compare api-gateway autoscaling and replica configuration between values-production.yaml and values-development.yaml.",
+    "expected_answer": "Production: autoscaling enabled=true with minReplicas=4, maxReplicas=20, targetCPUUtilizationPercentage=70. ScaleDown stabilizationWindowSeconds=300 with a 1-pod/60s policy; ScaleUp stabilizationWindowSeconds=60 with a 50%/60s policy. replicaCount=6, image.tag=v2.14.3, pullPolicy=IfNotPresent. PDB minAvailable=75%. Development: autoscaling enabled=false, replicaCount=1, image.tag=dev-latest, pullPolicy=Always, resource requests cpu=50m/memory=64Mi and limits cpu=500m/memory=512Mi. PDB disabled.",
+    "expected_sources": ["values-production.yaml", "values-development.yaml"],
+    "category": "helm",
+    "difficulty": "medium"
+  },
+  {
+    "id": "HELM-04",
+    "question": "In the base values.yaml, what global monitoring features are enabled, and what is the namespace-level istio-injection state for istio-system and argocd compared to other namespaces?",
+    "expected_answer": "global.monitoring: enabled=true, serviceMonitor=true, prometheusRules=true. Global annotation prometheus.io/scrape='true'. global.networkPolicy.enabled=true. Most namespaces (core, data, monitoring, security, ml, cache) have istio-injection=enabled in their labels. istio-system and argocd both have istio-injection=disabled — istio-system is the mesh control plane (sidecars must not be injected into istiod itself), and argocd is excluded from the mesh.",
+    "expected_sources": ["values.yaml"],
+    "category": "helm",
+    "difficulty": "medium"
+  },
+  {
+    "id": "HELM-05",
+    "question": "Compare auth-service configuration between values-production.yaml and values-development.yaml: what specific differences exist in image, replicas, autoscaling, env vars, resources, and PDB?",
+    "expected_answer": "Production auth-service: replicaCount=4, image.tag=v2.14.3, pullPolicy=IfNotPresent. Env: ENVIRONMENT=production, LOG_LEVEL=warn, ENABLE_PROFILING='false', ENABLE_DEBUG='false'. Autoscaling enabled with minReplicas=3, maxReplicas=12, targetCPUUtilizationPercentage=65. PDB enabled, minAvailable=75%. Development auth-service: replicaCount=1, image.tag=dev-latest, pullPolicy=Always. Env: ENVIRONMENT=development, LOG_LEVEL=debug, ENABLE_PROFILING='true', ENABLE_DEBUG='true'. Autoscaling disabled. PDB disabled. Resources: requests cpu=50m/memory=64Mi, limits cpu=250m/memory=256Mi.",
+    "expected_sources": ["values-production.yaml", "values-development.yaml"],
+    "category": "helm",
+    "difficulty": "hard"
+  },
+  {
+    "id": "DC-01",
+    "question": "In docker-compose.yaml, what zookeeper image is used and what client port and tick time are configured?",
+    "expected_answer": "Image: confluentinc/cp-zookeeper:7.6.0. Environment: ZOOKEEPER_CLIENT_PORT='2181', ZOOKEEPER_TICK_TIME='2000'. Port 2181:2181 is exposed to the host. Data persists in the zookeeper-data named volume. The service attaches to the `novacrest` network.",
+    "expected_sources": ["docker-compose.yaml"],
+    "category": "docker-compose",
+    "difficulty": "easy"
+  },
+  {
+    "id": "DC-02",
+    "question": "What Postgres image is used for postgres-auth in docker-compose.yaml, and what credentials, database name, and healthcheck are configured?",
+    "expected_answer": "Image: postgres:15.4-alpine. POSTGRES_DB=auth, POSTGRES_USER=auth_svc, POSTGRES_PASSWORD=localdev. Healthcheck runs `pg_isready -U auth_svc -d auth` (CMD-SHELL) every 10s with timeout 5s and 5 retries. Data persists in the postgres-auth-data named volume. The service attaches to the `novacrest` network.",
+    "expected_sources": ["docker-compose.yaml"],
+    "category": "docker-compose",
+    "difficulty": "easy"
+  },
+  {
+    "id": "DC-03",
+    "question": "In docker-compose.data.yaml, what Kafka image and port exposure does kafka-main use, what advertised listeners and security protocols are configured, and what is the offsets-topic replication factor?",
+    "expected_answer": "kafka-main uses confluentinc/cp-kafka:3.6.0 with two ports exposed to the host: 9092:9092 (in-cluster listener) and 29092:29092 (host-accessible listener). KAFKA_ADVERTISED_LISTENERS=`PLAINTEXT://kafka-main:9092,PLAINTEXT_HOST://localhost:29092`. KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=`PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT`. KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT. KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR='1'. KAFKA_AUTO_CREATE_TOPICS_ENABLE='true'. depends_on: zookeeper.",
+    "expected_sources": ["docker-compose.data.yaml"],
+    "category": "docker-compose",
+    "difficulty": "medium"
+  },
+  {
+    "id": "DC-04",
+    "question": "In docker-compose.data.yaml, how are redis-query-cache and redis-celery configured, and what command-line arguments enforce the eviction policy?",
+    "expected_answer": "Both services use image redis:7.2-alpine with the command `redis-server --maxmemory 256mb --maxmemory-policy allkeys-lfu`. Both expose port 6379 to the docker network and attach to the `novacrest` network. Healthcheck runs `redis-cli ping` (CMD) every 10s with timeout 5s and 5 retries. The allkeys-lfu policy evicts the least-frequently-used key from the entire keyspace once the 256 MB ceiling is reached.",
+    "expected_sources": ["docker-compose.data.yaml"],
+    "category": "docker-compose",
+    "difficulty": "medium"
+  },
+  {
+    "id": "TOPO-01",
+    "question": "In team-ownership.yaml, who is the lead and manager of platform-engineering, what services does the team own, and what Slack/PagerDuty channels do they use?",
+    "expected_answer": "Lead: Sarah Chen. Manager: Robert Torres. The team owns 6 services: config-service (tier 2, go, core namespace), feature-flags (tier 2, go, core), edge-proxy (tier 1, envoy, istio-system), canary-deployer (tier 3, go, core), migration-service (tier 3, python, core), cron-dispatcher (tier 2, go, core). Slack: #team-platform (team channel), #platform-oncall (oncall). PagerDuty service: platform-engineering. Domains owned: kubernetes, terraform, ci/cd, service-mesh, secrets-management.",
+    "expected_sources": ["team-ownership.yaml"],
+    "category": "topology",
+    "difficulty": "easy"
+  },
+  {
+    "id": "TOPO-02",
+    "question": "In environment-matrix.json, what AWS regions, VPC CIDRs, account IDs, and Kubernetes cluster names are configured for each of the four environments?",
+    "expected_answer": "production: aws_region=us-east-1, vpc_cidr=10.0.0.0/16, account=123456789012, k8s_cluster=nova-prod-east, domain prod.novacrest.io. production-eu: aws_region=eu-west-1, vpc_cidr=10.1.0.0/16, account=123456789013, k8s_cluster=nova-prod-eu, domain eu.novacrest.io. staging: aws_region=us-east-1, vpc_cidr=10.2.0.0/16, account=234567890123, k8s_cluster=nova-staging, domain staging.novacrest.io. development: aws_region=us-west-2, vpc_cidr=10.3.0.0/16, account=345678901234, k8s_cluster=nova-dev, domain dev.novacrest.io.",
+    "expected_sources": ["environment-matrix.json"],
+    "category": "topology",
+    "difficulty": "easy"
+  },
+  {
+    "id": "TOPO-03",
+    "question": "In network-topology.yaml, what subnet structure does the production VPC use across availability zones, and what NAT gateway / internet gateway / flow log configuration is in place?",
+    "expected_answer": "Production VPC: vpc_id=vpc-05b6224c, CIDR=10.0.0.0/16, region=us-east-1, account=123456789012. 9 subnets across 3 AZs (us-east-1a/b/c): 3 public subnets (10.0.1.0/24, 10.0.2.0/24, 10.0.3.0/24), 3 private-app subnets (10.0.10.0/24, 10.0.11.0/24, 10.0.12.0/24), 3 private-data subnets (10.0.20.0/24, 10.0.21.0/24, 10.0.22.0/24). One internet gateway named production-igw. Three NAT gateways (production-nat-us-east-1{a,b,c}) with elastic IPs eipalloc-017c980b, eipalloc-00cbcf56, eipalloc-02cbd912. VPC Flow Logs enabled to S3 bucket novacrest-vpc-flow-logs-123456789012 with ALL traffic type. DNS support and hostnames enabled.",
+    "expected_sources": ["network-topology.yaml"],
+    "category": "topology",
+    "difficulty": "medium"
+  },
+  {
+    "id": "TOPO-04",
+    "question": "In environment-matrix.json, how does the api-gateway service scale across the four environments? Compare replicas, HPA config, image tag, log level, and CPU/memory requests per environment.",
+    "expected_answer": "api-gateway is deployed in all four environments. Production: replicas=6, image_tag=v2.14.3, hpa_enabled=true with min_replicas=4, max_replicas=20, target_cpu=70, log_level=warn. Production-eu: replicas=4, image_tag=v2.14.3, hpa_enabled=true with min_replicas=2, max_replicas=14, target_cpu=70, log_level=warn. Staging: replicas=2, image_tag=staging-latest, hpa_enabled=true with min_replicas=2, max_replicas=6, target_cpu=70, log_level=info. Development: replicas=1, image_tag=dev-latest, hpa_enabled=false (no hpa block), log_level=debug. CPU and memory requests are constant across environments at 500m / 512Mi.",
+    "expected_sources": ["environment-matrix.json"],
+    "category": "topology",
+    "difficulty": "medium"
+  },
+  {
+    "id": "API-01",
+    "question": "In api-reference-billing-service.md, what stack is the service built on, what is its event-processing scale, and what financial responsibility does it carry?",
+    "expected_answer": "billing-service is built in Java 17 with Spring Boot 3.1. It processes approximately 4.2 million billing events daily and handles $2 billion ARR across 800+ enterprise customers. Service Tier 1 (Critical - Revenue Impact). Deployment: ArgoCD, 12 pods across 3 availability zones (us-east-1a/b/c). Internal base URL: https://billing-service.novacrest.internal. Partner API: https://api.novacrest.io/billing/v2.",
+    "expected_sources": ["api-reference-billing-service.md"],
+    "category": "api-reference",
+    "difficulty": "easy"
+  },
+  {
+    "id": "API-02",
+    "question": "In api-reference-ingest-service.md, what framework and language is the service built on, what request rate does it handle, and what protocols does it accept?",
+    "expected_answer": "ingest-service is built in Go using the Gin framework. It handles approximately 2.8 million requests per minute during peak hours across all production regions. Accepts telemetry data via HTTP/HTTPS and gRPC. Primary endpoints: https://ingest.novacrest.io (us-east-1), https://eu.ingest.novacrest.io (eu-west-1). Internal: http://ingest-service.backend-services.svc.cluster.local:8080. gRPC on port 9090 (internal only). Metrics on :9091/metrics (Prometheus format).",
+    "expected_sources": ["api-reference-ingest-service.md"],
+    "category": "api-reference",
+    "difficulty": "easy"
+  },
+  {
+    "id": "API-03",
+    "question": "In api-reference-tenant-manager.md, what three authentication methods does the service support, and what scopes do admin vs tenant API keys have?",
+    "expected_answer": "Three authentication methods: (1) Service-to-Service via mTLS using Istio-managed certificates, with required headers X-Service-Name and X-Request-ID. (2) Admin API Key for platform engineering and SRE — rotated quarterly, stored in 1Password (SRE vault), with scopes tenant:read, tenant:write, tenant:admin, quota:write. (3) Tenant API Key for enterprise customers generated via the NovaCrest Insights UI, limited to read-only tenant info and quota queries, with scopes tenant:read-self and quota:read-self.",
+    "expected_sources": ["api-reference-tenant-manager.md"],
+    "category": "api-reference",
+    "difficulty": "medium"
+  },
+  {
+    "id": "API-04",
+    "question": "In api-reference-billing-service.md, what is the production database setup, what key tables does the schema include with their row counts, and what disaster-recovery posture is described?",
+    "expected_answer": "Primary database: billing_db (PostgreSQL 14.9 on Aurora, us-east-1) at endpoint billing-db-prod.cluster-cxh92kd.us-east-1.rds.amazonaws.com:5432. Two read replicas for reporting queries. Backup: daily snapshots, 30-day retention, cross-region replication to us-west-2. Key tables and row counts: customers (820K rows), subscriptions (1.2M rows), invoices (8.4M rows), invoice_line_items (47M rows), usage_records (2.1B rows, partitioned monthly), payment_methods (890K rows), credits (124K rows).",
+    "expected_sources": ["api-reference-billing-service.md"],
+    "category": "api-reference",
+    "difficulty": "medium"
+  },
+  {
+    "id": "API-05",
+    "question": "In api-reference-ingest-service.md, what Kafka configuration does the production environment use, and what rate-limiting tiers are configured?",
+    "expected_answer": "Kafka brokers: 3 nodes b-1/b-2/b-3.novacrest-prod.kafka.us-east-1.amazonaws.com:9092 (MSK). Topics: KAFKA_TOPIC_METRICS=metrics-raw, KAFKA_TOPIC_LOGS=logs-raw, KAFKA_TOPIC_TRACES=traces-raw. Producer config: KAFKA_COMPRESSION=snappy, KAFKA_BATCH_SIZE=16384, KAFKA_LINGER_MS=10. Rate limiting: RATE_LIMIT_DEFAULT_RPS=1000, RATE_LIMIT_PREMIUM_RPS=5000, RATE_LIMIT_WINDOW=60s. Production deployment: 30 replicas in us-east-1 (autoscaling 20-50 based on CPU/RPS), 18 replicas in eu-west-1 (autoscaling 12-30), 2 CPU / 4Gi memory per pod.",
+    "expected_sources": ["api-reference-ingest-service.md"],
+    "category": "api-reference",
+    "difficulty": "medium"
+  },
+  {
     "id": "CROSS-01",
-    "question": "What port does the API gateway run on?",
-    "expected_answer": "Port 8080.",
-    "expected_sources": ["api-gateway.yaml", "cmdb-production.csv", "api-gateway-high-latency-troubleshooting.md"],
+    "question": "Combining the CMDB and the Kubernetes manifest for auth-service, what is auth-service's port, technology, team, and what container ports does the pod expose?",
+    "expected_answer": "From cmdb-production.csv: auth-service runs on port 8081, technology=go, team=backend-services, owner=marcus.williams@novacrest.io, supports api-gateway/admin-panel/edge-proxy. From auth-service.yaml (K8s manifest in core/): the Deployment exposes container port 8081 (http) and 9091 (metrics). Both sources agree on port 8081 as the http port.",
+    "expected_sources": ["cmdb-production.csv", "auth-service.yaml"],
     "category": "cross-document",
     "difficulty": "easy"
   },
   {
     "id": "CROSS-02",
-    "question": "What are the auth-service dependencies and what port does it use?",
-    "expected_answer": "Auth-service runs on port 8081 and depends on postgres-auth, vault, and redis-session.",
-    "expected_sources": ["cmdb-production.csv", "api-gateway-high-latency-troubleshooting.md"],
+    "question": "Combining environment-matrix.json (topology) and values-production.yaml (helm), what is api-gateway's production HPA and image config? Include CPU/memory requests from the topology source.",
+    "expected_answer": "values-production.yaml: replicaCount=6, image.tag=v2.14.3, pullPolicy=IfNotPresent, autoscaling enabled with minReplicas=4, maxReplicas=20, targetCPUUtilizationPercentage=70. environment-matrix.json (production block): replicas=6, image_tag=v2.14.3, hpa min_replicas=4 / max_replicas=20 / target_cpu=70, cpu_request=500m, memory_request=512Mi, log_level=warn. Both sources agree on the numbers; environment-matrix.json additionally captures cpu_request and memory_request explicitly at 500m/512Mi.",
+    "expected_sources": ["environment-matrix.json", "values-production.yaml"],
     "category": "cross-document",
     "difficulty": "medium"
   },
   {
     "id": "CROSS-03",
-    "question": "How many ClickHouse shards does NovaCrest run and what drove the decision to use that configuration?",
-    "expected_answer": "3 shards with 2 replicas each (18 nodes total). This was decided in ADR-001 based on an 8-week evaluation where ClickHouse demonstrated 143M data points/sec sustained write throughput and 18.5x compression ratio.",
-    "expected_sources": ["adr-adr-001-choosing-clickhouse-over-timescaledb-for-metrics-storage.md", "capacity-clickhouse-storage-capacity-planning.md", "architecture-architecture-overview-novacrest-insights-platform.md"],
+    "question": "Combining ADR-013 and the msk.tf.json Terraform configuration, what Kafka migration was decided in ADR-013 and what is the current MSK Terraform configuration?",
+    "expected_answer": "ADR-013 decided to migrate from Amazon MSK to self-hosted Kafka on EKS using the Strimzi Operator, with a Q2 2024 (April-June) timeline and projected 35% cost savings (~$310K) over 3 years. The current MSK Terraform configuration (msk.tf.json) defines: cluster_name=novacrest-kafka-prod, kafka_version=3.6, 6 broker nodes on kafka.m5.2xlarge, 1000 GB EBS storage per broker, encryption_in_transit (client_broker=TLS, in_cluster=true), encryption_at_rest_kms_key_arn referencing aws_kms_key.msk. aws_msk_configuration server_properties: auto.create.topics.enable=false, default.replication.factor=3, min.insync.replicas=2, num.partitions=12, log.retention.hours=168, log.segment.bytes=1073741824.",
+    "expected_sources": ["adr-adr-013-kafka-msk-vs-self-hosted-kafka.md", "msk.tf.json"],
+    "category": "cross-document",
+    "difficulty": "medium"
+  },
+  {
+    "id": "CROSS-04",
+    "question": "Combining cmdb-databases.csv, the billing-service API reference, and ADR-009, what is the auth/billing database setup and what migration decision affects tenant data?",
+    "expected_answer": "From cmdb-databases.csv: postgres-auth runs aurora 15.4 with storage_gb=500, instance_class=db.r6g.xlarge, multi_az=True, 2 read replicas, max_connections=200, backup_retention_days=35. From api-reference-billing-service.md: billing_db is PostgreSQL 14.9 on Aurora at billing-db-prod.cluster-cxh92kd.us-east-1.rds.amazonaws.com:5432, with 2 read replicas, daily snapshots, 30-day retention, and cross-region replication to us-west-2. From ADR-009: NovaCrest decided to migrate tenant configuration data to DynamoDB with Global Tables for multi-region replication; tenant billing data, audit logs, and user management remain in PostgreSQL because billing requires ACID, audit logs require complex relational queries, and auth-service authentication still uses PostgreSQL.",
+    "expected_sources": ["cmdb-databases.csv", "api-reference-billing-service.md", "adr-adr-009-dynamodb-for-tenant-config-vs-postgresql.md"],
+    "category": "cross-document",
+    "difficulty": "medium"
+  },
+  {
+    "id": "CROSS-05",
+    "question": "Combining INC-2023-013 (the billing double-charge incident) and the rate-limiter Redis failover runbook, what cron-dispatcher Redis race caused the incident, and what different Redis-dependency failure mode does the rate-limiter runbook cover?",
+    "expected_answer": "INC-2023-013 root cause (correctness failure): a non-atomic EXISTS+SET race condition in cron-dispatcher's Redis lock acquisition allowed both replicas to acquire the same lock during a Kafka-rebalance network partition (kafka-3 broker maintenance restart in us-east-1a). Both replicas published the December billing job to Kafka, and billing-service processed both events without deduplication, double-charging 278 customers ($47,300 in duplicate charges). The fix replaced EXISTS+SET with Redis SETNX via a Lua script for atomic check-and-set. The rate-limiter Redis failover runbook (rate-limiter-rate-limit-redis-failover.md) addresses a different class of problem (availability failure): when redis-ratelimit fails over — typical 10-45 second window — rate-limiter sees READONLY / connection-refused errors and api-gateway falls back to local in-memory rate limiting (non-distributed and less accurate). Both documents illustrate Redis as a load-bearing distributed-state critical path, but they describe distinct failure classes: a lock-protocol bug (correctness) versus Redis primary unavailability (availability).",
+    "expected_sources": ["INC-2023-013-billing-service-double-charging-during-kafka-rebalance.md", "rate-limiter-rate-limit-redis-failover.md"],
     "category": "cross-document",
     "difficulty": "hard"
   },
   {
-    "id": "CONV-01",
-    "question": "Tell me about the Elasticsearch incident",
-    "expected_answer": "INC-2022-001 was a SEV2 incident where Elasticsearch disk watermark breach blocked log ingestion for 45 minutes, affecting 823 customers.",
-    "expected_sources": ["INC-2022-001-elasticsearch-disk-watermark-breach-blocking-log-ingestion.md"],
-    "category": "conversational",
-    "difficulty": "easy",
-    "followup": {
-      "question": "What was the root cause?",
-      "expected_answer": "ILM policy failures combined with Acme Corp's 3x log volume spike (800GB/day to 2.4TB/day from 400 new K8s clusters), causing warm nodes to hit 81% disk capacity and refuse new shard allocations.",
-      "expected_sources": ["INC-2022-001-elasticsearch-disk-watermark-breach-blocking-log-ingestion.md"]
-    }
+    "id": "REF-01",
+    "question": "What is the monthly per-seat price of NovaCrest Insights' Enterprise tier?",
+    "expected_answer": "REFUSAL — there are no pricing/SKU/per-seat figures for any NovaCrest tier in the corpus. The system should respond with a refusal pattern such as 'I could not find this information in the available documents.'",
+    "expected_sources": [],
+    "category": "refusal",
+    "difficulty": "easy"
   },
   {
-    "id": "CONV-02",
-    "question": "What is the API gateway's technology stack?",
-    "expected_answer": "Go 1.22 with chi router framework, running 6 replicas in production.",
-    "expected_sources": ["api-gateway-high-latency-troubleshooting.md", "cmdb-production.csv"],
-    "category": "conversational",
-    "difficulty": "easy",
-    "followup": {
-      "question": "What are its resource limits?",
-      "expected_answer": "CPU: 500m request / 2000m limit. Memory: 512Mi request / 2Gi limit.",
-      "expected_sources": ["api-gateway.yaml"]
-    }
+    "id": "REF-02",
+    "question": "Who attended the Q3 2026 NovaCrest engineering offsite, and what topics were discussed?",
+    "expected_answer": "REFUSAL — the corpus contains no records of company offsites, events, or attendee lists. The system should refuse with a 'could not find' response rather than fabricating attendees from team-ownership.yaml.",
+    "expected_sources": [],
+    "category": "refusal",
+    "difficulty": "easy"
+  },
+  {
+    "id": "REF-03",
+    "question": "What was the root cause and resolution of incident INC-2027-001?",
+    "expected_answer": "REFUSAL — the incident set ends at INC-2026-100; there are no 2027 incidents in the corpus. The system should refuse rather than extrapolate from earlier incident patterns.",
+    "expected_sources": [],
+    "category": "refusal",
+    "difficulty": "medium"
+  },
+  {
+    "id": "REF-04",
+    "question": "What is the title of ADR-016, NovaCrest's multi-cloud strategy decision?",
+    "expected_answer": "REFUSAL — only ADR-001 through ADR-015 exist in the corpus, and none of them are about multi-cloud strategy. The system should refuse to invent a title for a non-existent ADR.",
+    "expected_sources": [],
+    "category": "refusal",
+    "difficulty": "medium"
+  },
+  {
+    "id": "REF-05",
+    "question": "How is the tenant-manager's GraphQL API authenticated, and what are its query rate limits?",
+    "expected_answer": "REFUSAL — tenant-manager exposes a REST API (per api-reference-tenant-manager.md, OpenAPI 3.0 spec at /openapi.yaml), not GraphQL. The expected_sources is empty because the question's premise is false. The system should refuse and ideally clarify that tenant-manager uses REST, not GraphQL.",
+    "expected_sources": [],
+    "category": "refusal",
+    "difficulty": "hard"
+  },
+  {
+    "id": "AGG-01",
+    "question": "From cmdb-production.csv, which services have status 'degraded' or 'maintenance'? List name, team, and owner_email for each.",
+    "expected_answer": "degraded services (5 rows): api-gateway (backend-services, marcus.williams@novacrest.io), etl-worker (data-engineering, priya.patel@novacrest.io), canary-deployer (platform-engineering, sarah.chen@novacrest.io), postgres-alerts (platform-engineering, sarah.chen@novacrest.io), elasticsearch-audit (security-engineering, aisha.nakamura@novacrest.io). maintenance services (6 rows): schema-registry (data-engineering, priya.patel@novacrest.io), dead-letter-processor (sre, james.obrien@novacrest.io), postgres-audit (security-engineering, aisha.nakamura@novacrest.io), s3-data-lake (data-engineering, priya.patel@novacrest.io), s3-dlq-archive (sre, james.obrien@novacrest.io), jaeger (sre, james.obrien@novacrest.io). Total: 5 degraded + 6 maintenance = 11 non-operational rows.",
+    "expected_sources": ["cmdb-production.csv"],
+    "category": "aggregation",
+    "difficulty": "medium"
+  },
+  {
+    "id": "AGG-02",
+    "question": "From the Puppetfile, list all internal NovaCrest modules (those sourced from internal Git repositories) and their repository URLs.",
+    "expected_answer": "Six internal modules, all sourced from `git@github.com:novacrest/puppet-*.git` with branch=main: novacrest-base (puppet-base.git), novacrest-kafka (puppet-kafka.git), novacrest-vault (puppet-vault.git), novacrest-consul (puppet-consul.git), novacrest-security_baseline (puppet-security-baseline.git), novacrest-backup (puppet-backup.git).",
+    "expected_sources": ["Puppetfile"],
+    "category": "aggregation",
+    "difficulty": "medium"
+  },
+  {
+    "id": "AGG-03",
+    "question": "From cmdb-databases.csv, which postgres databases have a backup_retention_days value greater than 30? List each with its retention period.",
+    "expected_answer": "Four postgres databases have backup_retention_days > 30: postgres-auth (35 days, authentication database encrypted at rest with KMS), postgres-tenants (35 days, tenant configuration and provisioning state), postgres-billing (90 days, financial audit requirements per description), postgres-audit (2555 days, ~7 years — description: 'Immutable audit log. 7-year retention for compliance. Append-only, no deletions allowed.'). The remaining postgres databases sit at 14-30 days.",
+    "expected_sources": ["cmdb-databases.csv"],
+    "category": "aggregation",
+    "difficulty": "hard"
   }
 ]

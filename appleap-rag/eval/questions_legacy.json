@@ -1,0 +1,244 @@
+[
+  {
+    "id": "INC-01",
+    "question": "How many customers were affected by the Elasticsearch disk watermark breach incident?",
+    "expected_answer": "823 enterprise customers were affected with 15-45 minute delays in log ingestion.",
+    "expected_sources": ["INC-2022-001-elasticsearch-disk-watermark-breach-blocking-log-ingestion.md"],
+    "category": "incident",
+    "difficulty": "easy"
+  },
+  {
+    "id": "INC-02",
+    "question": "Who was the incident commander for the Elasticsearch disk watermark breach and what was the estimated SLA credit impact?",
+    "expected_answer": "Sarah Chen (Platform Engineering) was the IC. The estimated SLA credit impact was $12,000.",
+    "expected_sources": ["INC-2022-001-elasticsearch-disk-watermark-breach-blocking-log-ingestion.md"],
+    "category": "incident",
+    "difficulty": "medium"
+  },
+  {
+    "id": "INC-03",
+    "question": "What caused the Kafka consumer lag to peak at 847,392 messages for the log-processor?",
+    "expected_answer": "The ILM policy failed to transition old indices because warm nodes were at 81% disk capacity, and Acme Corp had a 3x log volume spike from 800GB/day to 2.4TB/day due to deploying 400 new Kubernetes clusters.",
+    "expected_sources": ["INC-2022-001-elasticsearch-disk-watermark-breach-blocking-log-ingestion.md"],
+    "category": "incident",
+    "difficulty": "hard"
+  },
+  {
+    "id": "RUN-01",
+    "question": "What is the P99 latency alert threshold for the API gateway?",
+    "expected_answer": "The P99 latency alert threshold is >2000ms for more than 5 minutes.",
+    "expected_sources": ["api-gateway-high-latency-troubleshooting.md"],
+    "category": "runbook",
+    "difficulty": "easy"
+  },
+  {
+    "id": "RUN-02",
+    "question": "What framework and language is the API gateway written in, and what are its HPA scaling limits?",
+    "expected_answer": "The API gateway is written in Go 1.22 using the chi router framework. HPA scales between 4 and 20 pods.",
+    "expected_sources": ["api-gateway-high-latency-troubleshooting.md"],
+    "category": "runbook",
+    "difficulty": "medium"
+  },
+  {
+    "id": "RUN-03",
+    "question": "What goroutine count per pod is a red flag for the API gateway and who should be escalated to if the incident lasts over 1 hour?",
+    "expected_answer": "A goroutine count >5000 per pod is a red flag. Escalate to Jennifer Liu if the incident lasts >1 hour or reaches P1 severity.",
+    "expected_sources": ["api-gateway-high-latency-troubleshooting.md"],
+    "category": "runbook",
+    "difficulty": "hard"
+  },
+  {
+    "id": "ARCH-01",
+    "question": "How many metrics per minute does the NovaCrest Insights Platform process?",
+    "expected_answer": "2.8 billion metrics per minute.",
+    "expected_sources": ["architecture-architecture-overview-novacrest-insights-platform.md"],
+    "category": "architecture",
+    "difficulty": "easy"
+  },
+  {
+    "id": "ARCH-02",
+    "question": "How many Kafka brokers does NovaCrest run and how many partitions does the metrics.raw topic have?",
+    "expected_answer": "6 Kafka brokers (m5.4xlarge) across 3 availability zones. The metrics.raw topic has 48 partitions with 72-hour retention.",
+    "expected_sources": ["architecture-architecture-overview-novacrest-insights-platform.md"],
+    "category": "architecture",
+    "difficulty": "medium"
+  },
+  {
+    "id": "ARCH-03",
+    "question": "What is the P99 latency for the metrics processing pipeline from ingestion to ClickHouse write?",
+    "expected_answer": "The P99 latency is 285ms for the metrics-processor pipeline from ingestion to ClickHouse write.",
+    "expected_sources": ["architecture-architecture-overview-novacrest-insights-platform.md"],
+    "category": "architecture",
+    "difficulty": "medium"
+  },
+  {
+    "id": "K8S-01",
+    "question": "What are the CPU and memory resource limits for the API gateway Kubernetes deployment?",
+    "expected_answer": "CPU: 500m request / 2000m limit. Memory: 512Mi request / 2Gi limit.",
+    "expected_sources": ["api-gateway.yaml"],
+    "category": "kubernetes",
+    "difficulty": "easy"
+  },
+  {
+    "id": "K8S-02",
+    "question": "What is the liveness probe configuration for the API gateway pods?",
+    "expected_answer": "Liveness probe: HTTP GET /healthz on port 8080, initialDelaySeconds 15, periodSeconds 10, timeoutSeconds 3, failureThreshold 3.",
+    "expected_sources": ["api-gateway.yaml"],
+    "category": "kubernetes",
+    "difficulty": "medium"
+  },
+  {
+    "id": "K8S-03",
+    "question": "What is the HPA target CPU utilization for the API gateway and what anti-affinity rule is configured?",
+    "expected_answer": "HPA targets 70% CPU utilization. Anti-affinity: preferredDuringSchedulingIgnoredDuringExecution with weight 100 on kubernetes.io/hostname to spread pods across nodes.",
+    "expected_sources": ["api-gateway.yaml"],
+    "category": "kubernetes",
+    "difficulty": "hard"
+  },
+  {
+    "id": "TF-01",
+    "question": "What are the EKS cluster names used in NovaCrest's production Terraform configuration?",
+    "expected_answer": "nova-prod-east (production), nova-prod-eu (production EU), and nova-staging (staging).",
+    "expected_sources": ["eks.tf.json"],
+    "category": "terraform",
+    "difficulty": "easy"
+  },
+  {
+    "id": "TF-02",
+    "question": "Is the EKS production cluster publicly accessible and what encryption is configured?",
+    "expected_answer": "No, endpoint_public_access is false for production and production-eu clusters. KMS encryption is configured for secrets.",
+    "expected_sources": ["eks.tf.json"],
+    "category": "terraform",
+    "difficulty": "medium"
+  },
+  {
+    "id": "CMDB-01",
+    "question": "What port does the ingest-service run on and what language is it written in?",
+    "expected_answer": "The ingest-service runs on port 8090 and is written in Rust.",
+    "expected_sources": ["cmdb-production.csv"],
+    "category": "cmdb",
+    "difficulty": "easy"
+  },
+  {
+    "id": "CMDB-02",
+    "question": "Which services in the CMDB have a degraded status?",
+    "expected_answer": "The api-gateway and etl-worker have degraded status.",
+    "expected_sources": ["cmdb-production.csv"],
+    "category": "cmdb",
+    "difficulty": "medium"
+  },
+  {
+    "id": "CMDB-03",
+    "question": "Who is the owner of the api-gateway service and what team manages it?",
+    "expected_answer": "The api-gateway is owned by marcus.williams@novacrest.io and managed by the backend-services team.",
+    "expected_sources": ["cmdb-production.csv"],
+    "category": "cmdb",
+    "difficulty": "easy"
+  },
+  {
+    "id": "PLAY-01",
+    "question": "How much raw storage does NovaCrest's ClickHouse cluster currently hold?",
+    "expected_answer": "340TB of raw storage across 3 shards with 2 replicas each.",
+    "expected_sources": ["capacity-clickhouse-storage-capacity-planning.md"],
+    "category": "playbook",
+    "difficulty": "easy"
+  },
+  {
+    "id": "PLAY-02",
+    "question": "Who needs to approve the ClickHouse storage capacity planning procedure?",
+    "expected_answer": "Priya Patel (owner lead), David Nakamura (manager), and the Infrastructure VP.",
+    "expected_sources": ["capacity-clickhouse-storage-capacity-planning.md"],
+    "category": "playbook",
+    "difficulty": "medium"
+  },
+  {
+    "id": "ADR-01",
+    "question": "Why did NovaCrest choose ClickHouse over TimescaleDB for metrics storage?",
+    "expected_answer": "ClickHouse achieved 143M data points/sec sustained write throughput vs TimescaleDB's 12M. ClickHouse P95 query latency was 420ms vs 2.8s. ClickHouse compression was 18.5x vs 8x. Projected annual savings of $2.9M/year.",
+    "expected_sources": ["adr-adr-001-choosing-clickhouse-over-timescaledb-for-metrics-storage.md"],
+    "category": "adr",
+    "difficulty": "medium"
+  },
+  {
+    "id": "ADR-02",
+    "question": "What is the ClickHouse cluster configuration and sharding key decided in ADR-001?",
+    "expected_answer": "3 shards, 2 replicas, 18 nodes total (m5.4xlarge: 16 vCPU, 64GB RAM, 8TB NVMe per node). Sharding key: sipHash64(customer_id, metric_name).",
+    "expected_sources": ["adr-adr-001-choosing-clickhouse-over-timescaledb-for-metrics-storage.md"],
+    "category": "adr",
+    "difficulty": "hard"
+  },
+  {
+    "id": "ADR-03",
+    "question": "What was the projected monthly cost savings of switching from TimescaleDB to ClickHouse?",
+    "expected_answer": "ClickHouse projected at $98K/month vs TimescaleDB at $187K/month for storage, saving approximately $242K/month or $2.9M/year.",
+    "expected_sources": ["adr-adr-001-choosing-clickhouse-over-timescaledb-for-metrics-storage.md"],
+    "category": "adr",
+    "difficulty": "medium"
+  },
+  {
+    "id": "PUPPET-01",
+    "question": "What is the dependency chain order in the Puppet base module?",
+    "expected_answer": "ntp -> ssh -> users -> sudoers -> firewall_base -> rsyslog -> logrotate -> motd",
+    "expected_sources": ["init.pp"],
+    "category": "puppet",
+    "difficulty": "medium"
+  },
+  {
+    "id": "PUPPET-02",
+    "question": "What boolean parameters does the Puppet base class accept?",
+    "expected_answer": "manage_ntp, manage_ssh, manage_users, manage_firewall, manage_syslog (all Boolean, all default true).",
+    "expected_sources": ["init.pp"],
+    "category": "puppet",
+    "difficulty": "easy"
+  },
+  {
+    "id": "CROSS-01",
+    "question": "What port does the API gateway run on?",
+    "expected_answer": "Port 8080.",
+    "expected_sources": ["api-gateway.yaml", "cmdb-production.csv", "api-gateway-high-latency-troubleshooting.md"],
+    "category": "cross-document",
+    "difficulty": "easy"
+  },
+  {
+    "id": "CROSS-02",
+    "question": "What are the auth-service dependencies and what port does it use?",
+    "expected_answer": "Auth-service runs on port 8081 and depends on postgres-auth, vault, and redis-session.",
+    "expected_sources": ["cmdb-production.csv", "api-gateway-high-latency-troubleshooting.md"],
+    "category": "cross-document",
+    "difficulty": "medium"
+  },
+  {
+    "id": "CROSS-03",
+    "question": "How many ClickHouse shards does NovaCrest run and what drove the decision to use that configuration?",
+    "expected_answer": "3 shards with 2 replicas each (18 nodes total). This was decided in ADR-001 based on an 8-week evaluation where ClickHouse demonstrated 143M data points/sec sustained write throughput and 18.5x compression ratio.",
+    "expected_sources": ["adr-adr-001-choosing-clickhouse-over-timescaledb-for-metrics-storage.md", "capacity-clickhouse-storage-capacity-planning.md", "architecture-architecture-overview-novacrest-insights-platform.md"],
+    "category": "cross-document",
+    "difficulty": "hard"
+  },
+  {
+    "id": "CONV-01",
+    "question": "Tell me about the Elasticsearch incident",
+    "expected_answer": "INC-2022-001 was a SEV2 incident where Elasticsearch disk watermark breach blocked log ingestion for 45 minutes, affecting 823 customers.",
+    "expected_sources": ["INC-2022-001-elasticsearch-disk-watermark-breach-blocking-log-ingestion.md"],
+    "category": "conversational",
+    "difficulty": "easy",
+    "followup": {
+      "question": "What was the root cause?",
+      "expected_answer": "ILM policy failures combined with Acme Corp's 3x log volume spike (800GB/day to 2.4TB/day from 400 new K8s clusters), causing warm nodes to hit 81% disk capacity and refuse new shard allocations.",
+      "expected_sources": ["INC-2022-001-elasticsearch-disk-watermark-breach-blocking-log-ingestion.md"]
+    }
+  },
+  {
+    "id": "CONV-02",
+    "question": "What is the API gateway's technology stack?",
+    "expected_answer": "Go 1.22 with chi router framework, running 6 replicas in production.",
+    "expected_sources": ["api-gateway-high-latency-troubleshooting.md", "cmdb-production.csv"],
+    "category": "conversational",
+    "difficulty": "easy",
+    "followup": {
+      "question": "What are its resource limits?",
+      "expected_answer": "CPU: 500m request / 2000m limit. Memory: 512Mi request / 2Gi limit.",
+      "expected_sources": ["api-gateway.yaml"]
+    }
+  }
+]
