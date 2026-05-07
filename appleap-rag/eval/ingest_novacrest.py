@@ -20,6 +20,12 @@ SUPPORTED_EXTENSIONS = {
     ".yaml", ".yml", ".pp", ".tf", ".conf",
 }
 
+# Extensionless files we still want to ingest. Customer environments commonly
+# carry these as bare filenames at the repo root.
+SUPPORTED_FILENAMES = {
+    "Puppetfile", "Dockerfile", "Makefile", "Gemfile", "Rakefile", "Vagrantfile",
+}
+
 # .tf.json files need special handling (extension is .json but path contains .tf.json)
 SKIP_DIRS = {"__pycache__", ".git", "node_modules"}
 
@@ -38,6 +44,8 @@ def find_files(data_dir: Path) -> list[Path]:
         if path.suffix.lower() in SUPPORTED_EXTENSIONS:
             files.append(path)
         elif path.name.endswith(".tf.json"):
+            files.append(path)
+        elif path.name in SUPPORTED_FILENAMES:
             files.append(path)
     return files
 

@@ -183,6 +183,12 @@ ALLOWED_EXTENSIONS = {
     ".ts", ".tsx", ".sh", ".bash",
 }
 
+# Extensionless files commonly carried at repo roots. Matched by exact basename
+# (case-sensitive) since these conventions are case-specific.
+ALLOWED_FILENAMES = {
+    "Puppetfile", "Dockerfile", "Makefile", "Gemfile", "Rakefile", "Vagrantfile",
+}
+
 
 # ── Endpoints ───────────────────────────────────────────────────────
 
@@ -247,6 +253,14 @@ def _classify_extension(filename: str) -> str:
     return Path(filename).suffix.lower()
 
 
+def _is_file_supported(filename: str) -> bool:
+    """Accept files by either known extension or known extensionless basename
+    (e.g. Puppetfile, Dockerfile)."""
+    if _classify_extension(filename) in ALLOWED_EXTENSIONS:
+        return True
+    return Path(filename).name in ALLOWED_FILENAMES
+
+
 @app.post(
     "/ingest/file",
     response_model=IngestResponse,
@@ -264,12 +278,13 @@ async def ingest_file(
         raise HTTPException(status_code=400, detail="No filename provided")
 
     ext = _classify_extension(file.filename)
-    if ext not in ALLOWED_EXTENSIONS:
+    if not _is_file_supported(file.filename):
         raise HTTPException(
             status_code=400,
             detail=(
-                f"File type '{ext}' is not supported. "
+                f"File type '{ext or file.filename}' is not supported. "
                 f"Supported types: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+                f" or filenames: {', '.join(sorted(ALLOWED_FILENAMES))}"
             ),
         )
 
@@ -613,12 +628,13 @@ async def upload_attachment(
         raise HTTPException(status_code=400, detail="No filename provided")
 
     ext = _classify_extension(file.filename)
-    if ext not in ALLOWED_EXTENSIONS:
+    if not _is_file_supported(file.filename):
         raise HTTPException(
             status_code=400,
             detail=(
-                f"File type '{ext}' is not supported. "
+                f"File type '{ext or file.filename}' is not supported. "
                 f"Supported types: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+                f" or filenames: {', '.join(sorted(ALLOWED_FILENAMES))}"
             ),
         )
 

@@ -43,6 +43,11 @@ SUPPORTED_EXTENSIONS = {
     ".ts", ".tsx", ".sh", ".bash",
 }
 
+# Extensionless files (common at repo roots): Puppetfile, Dockerfile, etc.
+SUPPORTED_FILENAMES = {
+    "Puppetfile", "Dockerfile", "Makefile", "Gemfile", "Rakefile", "Vagrantfile",
+}
+
 
 def _classify_ext(name: str) -> str:
     lower = name.lower()
@@ -65,7 +70,9 @@ def _iter_files(path: Path):
 
 def _is_supported(path: Path) -> bool:
     ext = _classify_ext(path.name)
-    return ext in SUPPORTED_EXTENSIONS or ext == ".tf.json"
+    if ext in SUPPORTED_EXTENSIONS or ext == ".tf.json":
+        return True
+    return path.name in SUPPORTED_FILENAMES
 
 
 def upload_file(
