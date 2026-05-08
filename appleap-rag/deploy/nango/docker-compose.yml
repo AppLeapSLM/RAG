@@ -16,7 +16,8 @@ services:
     image: nangohq/nango-server:hosted
     restart: unless-stopped
     ports:
-      - "127.0.0.1:3003:3003"   # bound to localhost; Cloudflare Tunnel exposes it publicly
+      - "127.0.0.1:3003:8080"   # host:3003 -> container:8080 (Nango listens on 8080).
+                                # Bound to localhost; Cloudflare Tunnel exposes it publicly.
     environment:
       NANGO_DB_HOST: nango-db
       NANGO_DB_PORT: "5432"
