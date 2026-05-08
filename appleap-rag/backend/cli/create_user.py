@@ -19,10 +19,11 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import os
 import sys
-
-import httpx
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 
 def main() -> int:
@@ -60,27 +61,33 @@ def main() -> int:
         return 1
 
     url = args.api_url.rstrip("/") + "/auth/users"
+    body_bytes = json.dumps(
+        {"email": args.email, "password": password, "role": args.role}
+    ).encode("utf-8")
+    req = Request(
+        url,
+        data=body_bytes,
+        headers={
+            "Content-Type": "application/json",
+            "X-Admin-Token": token,
+        },
+        method="POST",
+    )
     try:
-        resp = httpx.post(
-            url,
-            json={"email": args.email, "password": password, "role": args.role},
-            headers={"X-Admin-Token": token},
-            timeout=30.0,
-        )
-    except httpx.HTTPError as e:
-        print(f"ERROR: HTTP request failed: {e}", file=sys.stderr)
+        with urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+            print(
+                f"Created user id={data['id']} email={data['email']} "
+                f"role={data['role']} active={data['active']}"
+            )
+            return 0
+    except HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        print(f"ERROR: server returned {e.code}: {detail}", file=sys.stderr)
+        return 3
+    except URLError as e:
+        print(f"ERROR: HTTP request failed: {e.reason}", file=sys.stderr)
         return 2
-
-    if resp.status_code == 200:
-        body = resp.json()
-        print(
-            f"Created user id={body['id']} email={body['email']} "
-            f"role={body['role']} active={body['active']}"
-        )
-        return 0
-
-    print(f"ERROR: server returned {resp.status_code}: {resp.text}", file=sys.stderr)
-    return 3
 
 
 if __name__ == "__main__":
