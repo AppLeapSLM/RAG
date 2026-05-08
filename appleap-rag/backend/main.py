@@ -257,6 +257,18 @@ ALLOWED_FILENAMES = {
 }
 
 
+def require_admin_token(x_admin_token: str | None = Header(default=None)):
+    """Gate for admin-only endpoints (corpus ingestion + first-user bootstrap).
+
+    If `admin_token` setting is empty, the gate is open (dev convenience).
+    Otherwise the caller must send a matching `X-Admin-Token` header.
+    """
+    if not settings.admin_token:
+        return
+    if x_admin_token != settings.admin_token:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+
 # ── Auth endpoints ──────────────────────────────────────────────────
 
 
@@ -407,18 +419,6 @@ async def ingest(req: IngestRequest, session: AsyncSession = Depends(get_session
 
     await session.commit()
     return IngestResponse(document_id=doc.id, chunks_stored=len(chunks))
-
-
-def require_admin_token(x_admin_token: str | None = Header(default=None)):
-    """Gate for admin-only endpoints (corpus ingestion).
-
-    If `admin_token` setting is empty, the gate is open (dev convenience).
-    Otherwise the caller must send a matching `X-Admin-Token` header.
-    """
-    if not settings.admin_token:
-        return
-    if x_admin_token != settings.admin_token:
-        raise HTTPException(status_code=403, detail="Unauthorized")
 
 
 def _classify_extension(filename: str) -> str:
