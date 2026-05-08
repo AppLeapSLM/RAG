@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -79,11 +79,40 @@ class Chunk(Base):
     )
 
 
+class User(Base):
+    """Authenticated user. Email is the canonical identity (also used as
+    user_id in the user_groups ACL cache and as the Bearer-token subject).
+    """
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(
+        String, primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    email: Mapped[str] = mapped_column(String, unique=True, nullable=False, index=True)
+    hashed_password: Mapped[str] = mapped_column(String, nullable=False)
+    role: Mapped[str] = mapped_column(String, nullable=False, default="user")  # 'admin' | 'user'
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class Conversation(Base):
     __tablename__ = "conversations"
 
     id: Mapped[str] = mapped_column(
         String, primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    # Owner. NULL only on legacy rows during the auth-rollout migration; the
+    # lifespan migration deletes those, so NULL should be transient.
+    owner_user_id: Mapped[Optional[str]] = mapped_column(
+        String,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
     title: Mapped[str] = mapped_column(String, nullable=False, default="New Chat")
     created_at: Mapped[datetime] = mapped_column(

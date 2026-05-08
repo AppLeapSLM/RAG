@@ -40,6 +40,15 @@ class Settings(BaseSettings):
     # Empty = signature check is skipped (dev only — DO NOT use in production).
     nango_signing_secret: str = ""
 
+    # Auth: HS256 JWT signing key. Empty = auth refuses to issue/validate tokens
+    # (every protected endpoint returns 503). Generate with: openssl rand -hex 64
+    jwt_secret: str = ""
+    jwt_lifetime_hours: int = 24
+    # bcrypt rounds. 12 ≈ 250ms on a 2 GHz core. Bumping is safe; lowering is not.
+    bcrypt_rounds: int = 12
+    # Minimum password length on user creation.
+    password_min_length: int = 12
+
     model_config = {"env_prefix": "APPLEAP_"}
 
 

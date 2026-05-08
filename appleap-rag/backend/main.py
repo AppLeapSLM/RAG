@@ -11,11 +11,21 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.auth import (
+    AuthedUser,
+    DUMMY_HASH,
+    encode_token,
+    get_user_conversation,
+    hash_password,
+    require_admin,
+    require_user,
+    verify_password,
+)
 from backend.chunking.chunker import chunk_parsed_document_async
 from backend.chunking.dispatch import process_file
 from backend.config import settings
 from backend.db.connection import engine, get_session
-from backend.db.models import Base, Chunk, Conversation, ConversationInlineAttachment, Document, Message
+from backend.db.models import Base, Chunk, Conversation, ConversationInlineAttachment, Document, Message, User
 from backend.embedding.embedder import embed_batch
 from backend.generation.llm import generate_answer, rewrite_query
 from backend.parsing.parser import parse_text
@@ -102,6 +112,31 @@ async def lifespan(app: FastAPI):
             ON chunks USING gin(metadata jsonb_path_ops)
         """))
 
+        # Auth rollout: one-shot legacy wipe.
+        # Detected by: conversations table exists but owner_user_id column does NOT.
+        # This runs once on the first deploy carrying auth, then never again.
+        # Cascades through messages, conversation_inline_attachments, and
+        # documents(source_type='attachment').
+        await conn.execute(__import__("sqlalchemy").text("""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_name = 'conversations'
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'conversations' AND column_name = 'owner_user_id'
+                ) THEN
+                    DELETE FROM conversations;
+                    ALTER TABLE conversations
+                        ADD COLUMN owner_user_id VARCHAR
+                        REFERENCES users(id) ON DELETE SET NULL;
+                    CREATE INDEX IF NOT EXISTS idx_conversations_owner_user_id
+                        ON conversations(owner_user_id);
+                END IF;
+            END $$
+        """))
+
         # Partial index on jobs.run_after for the worker hot path:
         # SELECT ... WHERE locked_at IS NULL AND run_after <= now() ORDER BY run_after.
         await conn.execute(__import__("sqlalchemy").text("""
@@ -176,6 +211,30 @@ class ConversationUpdate(BaseModel):
     title: str
 
 
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "Bearer"
+    expires_in: int
+
+
+class CreateUserRequest(BaseModel):
+    email: str
+    password: str
+    role: str = "user"  # 'admin' or 'user'
+
+
+class UserResponse(BaseModel):
+    id: str
+    email: str
+    role: str
+    active: bool
+
+
 ALLOWED_EXTENSIONS = {
     # Prose / office (via Unstructured.io)
     ".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls",
@@ -196,6 +255,115 @@ ALLOWED_EXTENSIONS = {
 ALLOWED_FILENAMES = {
     "Puppetfile", "Dockerfile", "Makefile", "Gemfile", "Rakefile", "Vagrantfile",
 }
+
+
+# ── Auth endpoints ──────────────────────────────────────────────────
+
+
+@app.post("/auth/login", response_model=LoginResponse)
+async def auth_login(
+    req: LoginRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """Exchange email + password for a Bearer JWT.
+
+    Constant-time response: if the email isn't registered, we still run a
+    bcrypt verify against a dummy hash so the response time matches a real
+    failed-password attempt. Defeats email-enumeration via timing.
+    """
+    from sqlalchemy import select as sa_select
+
+    if not settings.jwt_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication is not configured on this server",
+        )
+
+    email_norm = req.email.strip().lower()
+
+    row = await session.execute(
+        sa_select(User).where(User.email == email_norm)
+    )
+    user = row.scalar_one_or_none()
+
+    # Always run bcrypt verify (against the real hash if user exists, else
+    # against DUMMY_HASH). Both arms take ~250ms.
+    target_hash = user.hashed_password if user else DUMMY_HASH
+    password_ok = verify_password(req.password, target_hash)
+
+    # Uniform response on ANY failure mode (no user, wrong password,
+    # disabled account). Don't disclose which one.
+    if not user or not password_ok or not user.active:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    user.last_login_at = datetime.now(timezone.utc)
+    await session.commit()
+
+    token, expires_in = encode_token(user_id=user.id, email=user.email, role=user.role)
+    return LoginResponse(access_token=token, expires_in=expires_in)
+
+
+@app.post(
+    "/auth/users",
+    response_model=UserResponse,
+    dependencies=[Depends(require_admin_token)],
+)
+async def auth_create_user(
+    req: CreateUserRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """Admin-only user creation. Gated by X-Admin-Token (the existing admin
+    secret is the bootstrap path; once a real admin user exists, we'll add
+    a Bearer-admin path too).
+    """
+    from sqlalchemy import select as sa_select
+
+    if req.role not in ("admin", "user"):
+        raise HTTPException(status_code=400, detail="role must be 'admin' or 'user'")
+    if len(req.password) < settings.password_min_length:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Password must be at least {settings.password_min_length} characters",
+        )
+    if len(req.password.encode("utf-8")) > 72:
+        # bcrypt silently truncates beyond 72 bytes; reject up front so the
+        # full password is what gets verified.
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at most 72 bytes",
+        )
+
+    email_norm = req.email.strip().lower()
+    if "@" not in email_norm or " " in email_norm:
+        raise HTTPException(status_code=400, detail="Invalid email")
+
+    existing = await session.execute(
+        sa_select(User).where(User.email == email_norm)
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Email already registered")
+
+    user = User(
+        email=email_norm,
+        hashed_password=hash_password(req.password),
+        role=req.role,
+        active=True,
+    )
+    session.add(user)
+    await session.commit()
+    return UserResponse(id=user.id, email=user.email, role=user.role, active=user.active)
+
+
+@app.get("/auth/me", response_model=UserResponse)
+async def auth_me(user: AuthedUser = Depends(require_user)):
+    """Echo the authenticated user back. Useful for the frontend to
+    verify the cached token is still valid.
+
+    Note: returns claims from the JWT, not a fresh DB lookup. If you've been
+    disabled (active=false), this still echoes active=true until your token
+    expires (≤ jwt_lifetime_hours).
+    """
+    return UserResponse(id=user.id, email=user.email, role=user.role, active=True)
 
 
 # ── Endpoints ───────────────────────────────────────────────────────
@@ -375,26 +543,21 @@ async def ingest_file(
 async def query(
     req: QueryRequest,
     session: AsyncSession = Depends(get_session),
-    x_user_email: str | None = Header(default=None),
+    user: AuthedUser = Depends(require_user),
 ):
     """Answer a question using retrieved context, with conversation memory.
 
-    If conversation_id is provided, loads history for query rewriting and
-    context-aware generation. If omitted, auto-creates a new conversation.
-
-    The optional `X-User-Email` header drives ACL filtering on retrieved
-    chunks. When omitted (eval, pre-auth), ACL filtering is bypassed —
-    callers in production are expected to set this via auth middleware.
+    If conversation_id is provided, the caller MUST own it (404 otherwise).
+    If omitted, a new conversation is auto-created and owned by the caller.
+    The authenticated user's email drives ACL filtering on retrieved chunks.
     """
     from sqlalchemy import select as sa_select
 
-    # 1. Resolve or create conversation
+    # 1. Resolve or create conversation (ownership enforced)
     if req.conversation_id:
-        conv = await session.get(Conversation, req.conversation_id)
-        if not conv:
-            raise HTTPException(status_code=404, detail="Conversation not found")
+        conv = await get_user_conversation(req.conversation_id, user, session)
     else:
-        conv = Conversation(title="New Chat")
+        conv = Conversation(title="New Chat", owner_user_id=user.id)
         session.add(conv)
         await session.flush()
 
@@ -432,13 +595,14 @@ async def query(
     # 3. Rewrite query using history (resolves pronouns, references)
     search_query = await rewrite_query(req.question, history)
 
-    # 4. Retrieve relevant chunks — corpus + this conv's chunked attachments
+    # 4. Retrieve relevant chunks — corpus + this conv's chunked attachments.
+    #    user.email drives ACL filtering; sourced from the JWT, never headers.
     results = await search(
         search_query,
         session,
         top_k=req.top_k,
         conversation_id=conv.id,
-        user_email=x_user_email,
+        user_email=user.email,
     )
 
     # 5. Generate answer with full history + inline attachments + retrieved chunks
@@ -499,8 +663,12 @@ async def query(
 
 
 @app.get("/conversations", response_model=list[ConversationSummary])
-async def list_conversations(session: AsyncSession = Depends(get_session)):
-    """List all conversations, most recent first."""
+async def list_conversations(
+    session: AsyncSession = Depends(get_session),
+    user: AuthedUser = Depends(require_user),
+):
+    """List the caller's conversations, most recent first. Other users'
+    conversations are NEVER returned, regardless of role."""
     from sqlalchemy import func, select as sa_select
 
     # Subquery: message count per conversation
@@ -517,6 +685,7 @@ async def list_conversations(session: AsyncSession = Depends(get_session)):
         await session.execute(
             sa_select(Conversation, msg_count.c.msg_count)
             .outerjoin(msg_count, Conversation.id == msg_count.c.conversation_id)
+            .where(Conversation.owner_user_id == user.id)
             .order_by(Conversation.updated_at.desc())
         )
     ).all()
@@ -534,10 +703,13 @@ async def list_conversations(session: AsyncSession = Depends(get_session)):
 
 
 @app.post("/conversations")
-async def create_conversation(session: AsyncSession = Depends(get_session)):
-    """Create an empty conversation. Useful when the UI needs a conv_id
-    before sending a message (e.g., to attach a file first)."""
-    conv = Conversation(title="New Chat")
+async def create_conversation(
+    session: AsyncSession = Depends(get_session),
+    user: AuthedUser = Depends(require_user),
+):
+    """Create an empty conversation owned by the caller. Useful when the UI
+    needs a conv_id before sending a message (e.g., to attach a file first)."""
+    conv = Conversation(title="New Chat", owner_user_id=user.id)
     session.add(conv)
     await session.flush()
     await session.commit()
@@ -548,13 +720,12 @@ async def create_conversation(session: AsyncSession = Depends(get_session)):
 async def get_conversation(
     conversation_id: str,
     session: AsyncSession = Depends(get_session),
+    user: AuthedUser = Depends(require_user),
 ):
-    """Load a full conversation with all messages."""
+    """Load a full conversation with all messages. 404 if not owned."""
     from sqlalchemy import select as sa_select
 
-    conv = await session.get(Conversation, conversation_id)
-    if not conv:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+    conv = await get_user_conversation(conversation_id, user, session)
 
     rows = (
         await session.execute(
@@ -590,11 +761,10 @@ async def update_conversation(
     conversation_id: str,
     req: ConversationUpdate,
     session: AsyncSession = Depends(get_session),
+    user: AuthedUser = Depends(require_user),
 ):
-    """Rename a conversation."""
-    conv = await session.get(Conversation, conversation_id)
-    if not conv:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+    """Rename a conversation. 404 if not owned."""
+    conv = await get_user_conversation(conversation_id, user, session)
 
     conv.title = req.title
     conv.updated_at = datetime.now(timezone.utc)
@@ -606,13 +776,13 @@ async def update_conversation(
 async def delete_conversation(
     conversation_id: str,
     session: AsyncSession = Depends(get_session),
+    user: AuthedUser = Depends(require_user),
 ):
-    """Delete a conversation and all its messages."""
+    """Delete a conversation and all its messages. 404 if not owned."""
     from sqlalchemy import delete as sa_delete
 
-    conv = await session.get(Conversation, conversation_id)
-    if not conv:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+    # Ownership check (raises 404 if not owned).
+    await get_user_conversation(conversation_id, user, session)
 
     await session.execute(
         sa_delete(Message).where(Message.conversation_id == conversation_id)
@@ -632,17 +802,16 @@ async def upload_attachment(
     conversation_id: str,
     file: UploadFile = File(...),
     session: AsyncSession = Depends(get_session),
+    user: AuthedUser = Depends(require_user),
 ):
-    """Upload a file scoped to one conversation.
+    """Upload a file scoped to one conversation. 404 if not owned.
 
     ≤ `inline_attachment_threshold_kb` → stored as inline (full text prepended
     to every turn's context). Otherwise → parsed, chunked, embedded, and
     stored as a conversation-scoped document that participates in retrieval
     only for this conversation.
     """
-    conv = await session.get(Conversation, conversation_id)
-    if not conv:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+    conv = await get_user_conversation(conversation_id, user, session)
 
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided")
@@ -762,13 +931,12 @@ async def upload_attachment(
 async def list_attachments(
     conversation_id: str,
     session: AsyncSession = Depends(get_session),
+    user: AuthedUser = Depends(require_user),
 ):
-    """List all attachments (inline + chunked) for a conversation."""
+    """List all attachments (inline + chunked) for a conversation. 404 if not owned."""
     from sqlalchemy import select as sa_select
 
-    conv = await session.get(Conversation, conversation_id)
-    if not conv:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+    await get_user_conversation(conversation_id, user, session)
 
     inline_rows = (
         await session.execute(
@@ -812,13 +980,12 @@ async def delete_attachment(
     conversation_id: str,
     attachment_id: str,
     session: AsyncSession = Depends(get_session),
+    user: AuthedUser = Depends(require_user),
 ):
-    """Remove a single attachment (inline or chunked) from a conversation."""
+    """Remove a single attachment (inline or chunked) from a conversation. 404 if not owned."""
     from sqlalchemy import delete as sa_delete
 
-    conv = await session.get(Conversation, conversation_id)
-    if not conv:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+    await get_user_conversation(conversation_id, user, session)
 
     inline = await session.get(ConversationInlineAttachment, attachment_id)
     if inline and inline.conversation_id == conversation_id:
