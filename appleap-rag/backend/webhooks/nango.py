@@ -175,8 +175,9 @@ async def nango_webhook(
     # delivery has been seen — short-circuit before enqueueing duplicate work.
     insert_event = await session.execute(
         text("""
-            INSERT INTO processed_events (event_id, provider, connection_id, event_type)
-            VALUES (:event_id, :provider, :connection_id, :event_type)
+            INSERT INTO processed_events
+                (event_id, provider, connection_id, event_type, received_at)
+            VALUES (:event_id, :provider, :connection_id, :event_type, now())
             ON CONFLICT (event_id) DO NOTHING
         """),
         {
