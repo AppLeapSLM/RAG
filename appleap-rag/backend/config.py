@@ -36,8 +36,9 @@ class Settings(BaseSettings):
     # Embedding dimension (Nomic produces 768-dim vectors)
     embedding_dim: int = 768
 
-    # Google Drive connector
-    google_drive_credentials_path: str = ""
+    # Nango (self-hosted) — webhook receiver verifies HMAC against this secret.
+    # Empty = signature check is skipped (dev only — DO NOT use in production).
+    nango_signing_secret: str = ""
 
     model_config = {"env_prefix": "APPLEAP_"}
 

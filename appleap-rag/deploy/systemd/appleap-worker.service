@@ -1,0 +1,24 @@
+[Unit]
+Description=AppLeap RAG background worker (drains jobs queue)
+After=network.target postgresql.service appleap.service
+Wants=appleap.service
+
+[Service]
+Type=simple
+User=abhinav
+WorkingDirectory=/home/abhinav/appleap-rag/appleap-rag/appleap-rag
+Environment=PYTHONPATH=/home/abhinav/appleap-rag/appleap-rag/appleap-rag
+ExecStart=/home/abhinav/.local/bin/python3.13 -m backend.workers.run
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Secrets live in per-service drop-ins (mirrors the admin-token pattern
+# already used for appleap.service). Create:
+#   /etc/systemd/system/appleap-worker.service.d/secrets.conf
+# with [Service]\nEnvironment="APPLEAP_NANGO_SIGNING_SECRET=..." etc.
+# See deploy/nango/README.md for the exact steps.
+
+[Install]
+WantedBy=multi-user.target

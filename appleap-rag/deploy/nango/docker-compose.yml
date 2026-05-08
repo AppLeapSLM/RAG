@@ -1,0 +1,50 @@
+# Nango self-hosted, deployed alongside AppLeap RAG on the GCP VM.
+#
+# This is a starting point — verify against the current docs at
+# docs.nango.dev/host/self-host/local before deploying. Image tags and env
+# variable names occasionally change between Nango releases.
+#
+# Bring up:    docker compose --env-file .env up -d
+# Tail logs:   docker compose logs -f nango-server
+# Tear down:   docker compose down              # keeps the volume
+#              docker compose down -v           # nukes Nango's internal DB
+
+version: "3.9"
+
+services:
+  nango-server:
+    image: nangohq/nango-server:hosted
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3003:3003"   # bound to localhost; Cloudflare Tunnel exposes it publicly
+    environment:
+      NANGO_DB_HOST: nango-db
+      NANGO_DB_PORT: "5432"
+      NANGO_DB_USER: nango
+      NANGO_DB_PASSWORD: ${NANGO_DB_PASSWORD}
+      NANGO_DB_NAME: nango
+      NANGO_ENCRYPTION_KEY: ${NANGO_ENCRYPTION_KEY}        # base64-encoded 32 bytes
+      NANGO_SERVER_URL: ${NANGO_SERVER_URL}                # public URL via Cloudflare Tunnel
+      NANGO_SERVER_WEBSOCKETS_PATH: ""
+      LOG_LEVEL: info
+    depends_on:
+      nango-db:
+        condition: service_healthy
+
+  nango-db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: nango
+      POSTGRES_PASSWORD: ${NANGO_DB_PASSWORD}
+      POSTGRES_DB: nango
+    volumes:
+      - nango-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nango -d nango"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  nango-db-data:

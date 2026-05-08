@@ -6,6 +6,7 @@ import re
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.acl import acl_filter_raw
 from backend.config import settings
 from backend.db.models import Chunk
 
@@ -42,6 +43,8 @@ async def keyword_search(
     session: AsyncSession,
     top_k: int = settings.top_k,
     conversation_id: str | None = None,
+    user_email: str | None = None,
+    user_groups: list[str] | None = None,
 ) -> list[Chunk]:
     """BM25-style keyword search using PostgreSQL full-text search with OR semantics.
 
@@ -59,6 +62,9 @@ async def keyword_search(
     Scope (via JOIN documents):
     - conversation_id=None → corpus only
     - conversation_id set  → corpus + attachments for that conversation
+
+    ACL: when `user_email` is set, filters by chunks.metadata->'acl' against
+    user + groups. Bypassed when None (eval/pre-auth path).
     """
     tsquery = _build_or_tsquery(query)
     if not tsquery:
@@ -72,6 +78,19 @@ async def keyword_search(
     else:
         scope_clause = "AND d.source_type = 'corpus'"
 
+    params: dict = {"tsquery": tsquery, "top_k": top_k}
+    if conversation_id:
+        params["conv_id"] = conversation_id
+
+    if user_email:
+        acl_fragment, acl_params = acl_filter_raw(
+            user_email, user_groups or [], chunk_table="c"
+        )
+        acl_clause = f"AND {acl_fragment}"
+        params.update(acl_params)
+    else:
+        acl_clause = ""
+
     stmt = text(f"""
         SELECT c.id, c.document_id, c.content, c.chunk_index, c.embedding,
                c.metadata, c.created_at,
@@ -80,13 +99,10 @@ async def keyword_search(
         JOIN documents d ON c.document_id = d.id
         WHERE c.search_vector @@ to_tsquery('english', :tsquery)
         {scope_clause}
+        {acl_clause}
         ORDER BY rank DESC
         LIMIT :top_k
     """)
-
-    params: dict = {"tsquery": tsquery, "top_k": top_k}
-    if conversation_id:
-        params["conv_id"] = conversation_id
 
     try:
         result = await session.execute(stmt, params)

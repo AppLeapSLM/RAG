@@ -6,6 +6,7 @@ import logging
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.acl import acl_filter_textclause, resolve_user_groups
 from backend.config import settings
 from backend.db.models import Chunk, Document
 from backend.embedding.embedder import embed_text
@@ -30,6 +31,7 @@ async def search(
     top_k: int = settings.top_k,
     neighbor_window: int = settings.neighbor_window,
     conversation_id: str | None = None,
+    user_email: str | None = None,
 ) -> list[Chunk]:
     """Hybrid search: vector + keyword → union → cross-encoder rerank → top_k.
 
@@ -47,12 +49,28 @@ async def search(
     Scope:
     - When `conversation_id` is None: corpus only.
     - When set: corpus + chunked attachments tagged to that conversation.
+
+    ACL:
+    - When `user_email` is set, both retrievers filter by chunks.metadata->'acl'
+      using the user + their cached groups. Chunks without an `acl` key are
+      treated as public.
+    - When `user_email` is None (no header sent), ACL filtering is bypassed
+      entirely. This keeps the eval harness and pre-auth dev paths working;
+      auth middleware is expected to set the header in production.
     """
+    user_groups: list[str] = []
+    if user_email:
+        user_groups = await resolve_user_groups(session, user_email)
+
     vector_task = _vector_search(
-        query, session, top_k=VECTOR_OVERFETCH, conversation_id=conversation_id
+        query, session, top_k=VECTOR_OVERFETCH,
+        conversation_id=conversation_id,
+        user_email=user_email, user_groups=user_groups,
     )
     keyword_task = keyword_search(
-        query, session, top_k=KEYWORD_OVERFETCH, conversation_id=conversation_id
+        query, session, top_k=KEYWORD_OVERFETCH,
+        conversation_id=conversation_id,
+        user_email=user_email, user_groups=user_groups,
     )
     vector_results, keyword_results = await asyncio.gather(vector_task, keyword_task)
 
@@ -83,11 +101,15 @@ async def _vector_search(
     session: AsyncSession,
     top_k: int,
     conversation_id: str | None = None,
+    user_email: str | None = None,
+    user_groups: list[str] | None = None,
 ) -> list[Chunk]:
     """Pure vector similarity search via pgvector cosine distance.
 
     Scopes results to corpus docs plus (optionally) chunked attachments
     tagged to `conversation_id`. Never returns other conversations' attachments.
+
+    Applies ACL filter when `user_email` is set; bypassed otherwise.
     """
     query_embedding = await embed_text(query)
 
@@ -106,7 +128,15 @@ async def _vector_search(
         select(Chunk)
         .join(Document, Chunk.document_id == Document.id)
         .where(scope_filter)
-        .order_by(Chunk.embedding.cosine_distance(query_embedding))
+    )
+
+    if user_email:
+        stmt = stmt.where(
+            acl_filter_textclause(user_email, user_groups or [], chunk_table="chunks")
+        )
+
+    stmt = (
+        stmt.order_by(Chunk.embedding.cosine_distance(query_embedding))
         .limit(top_k)
     )
     result = await session.execute(stmt)

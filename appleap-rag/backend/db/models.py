@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -117,3 +117,82 @@ class Message(Base):
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
     metadata_: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)
+
+
+# ── Connector pipeline (Nango → receiver → jobs → workers) ──────────
+
+
+class ProcessedEvent(Base):
+    """Idempotency ledger. event_id is what the receiver dedups on; ON CONFLICT
+    DO NOTHING is the contract. Trimmed periodically (rows older than the
+    longest provider retry window are safe to delete).
+    """
+    __tablename__ = "processed_events"
+
+    event_id: Mapped[str] = mapped_column(String, primary_key=True)
+    provider: Mapped[str] = mapped_column(String, nullable=False)
+    connection_id: Mapped[str] = mapped_column(String, nullable=False)
+    event_type: Mapped[str] = mapped_column(String, nullable=False)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        index=True,
+    )
+
+
+class Job(Base):
+    """Postgres-native queue. Workers claim with FOR UPDATE SKIP LOCKED;
+    payload carries enough to re-fetch the document from Nango and dispatch
+    by `action`. The receiver only writes here; workers own everything else.
+    """
+    __tablename__ = "jobs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    run_after: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    locked_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    locked_by: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+
+
+class DeadLetterEvent(Base):
+    """Parking lot for jobs that exhausted retries. Manual review / replay."""
+    __tablename__ = "dead_letter_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    failed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False)
+    last_error: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+
+
+class UserGroup(Base):
+    """Cache of (user → group) memberships, refreshed by group_membership
+    webhook events. Query-time ACL filter uses this to expand a user's email
+    into the set of group_ids they belong to.
+
+    user_id is the user's email today (matches X-User-Email header). When real
+    auth lands later, this stays an email — the auth layer just becomes the
+    canonical source of the email.
+    """
+    __tablename__ = "user_groups"
+
+    user_id: Mapped[str] = mapped_column(String, primary_key=True)
+    group_id: Mapped[str] = mapped_column(String, primary_key=True)
+    provider: Mapped[str] = mapped_column(String, primary_key=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
