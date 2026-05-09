@@ -647,6 +647,11 @@ async function loadConversations() {
 
 async function openConversation(convId) {
   viewSeq++;
+  // Reset the (global) spinner UI on every navigation. Any in-flight
+  // /query whose mySeq is now stale won't touch sendBtn/thinking in its
+  // finally because of the seq-match guard.
+  sendBtn.disabled = false;
+  thinkingEl.classList.remove("visible");
   try {
     const r = await apiFetch(`${API}/conversations/${convId}`);
     if (!r.ok) return;
@@ -680,6 +685,9 @@ async function openConversation(convId) {
 
 function startNewChat() {
   viewSeq++;
+  // Reset the (global) spinner UI on every navigation. See openConversation.
+  sendBtn.disabled = false;
+  thinkingEl.classList.remove("visible");
   currentConversationId = null;
   const messagesEl = document.getElementById("messages");
   messagesEl.innerHTML = `
@@ -884,16 +892,21 @@ async function sendQuery() {
     // list regardless of whether the user is still viewing it.
     loadConversations();
 
-    if (viewSeq !== mySeq) {
-      // User navigated away. Drop the UI render; the conversation row in
-      // the sidebar will let them reopen it to see the answer.
-      return;
+    if (viewSeq === mySeq) {
+      // Same view, render locally.
+      if (data.conversation_id) currentConversationId = data.conversation_id;
+      appendMessage("assistant", data.answer, data.sources);
+    } else if (data.conversation_id && currentConversationId === data.conversation_id) {
+      // The user navigated away (e.g., New Chat) and then back to the
+      // conversation this query was for. Their locally-rendered user
+      // message was wiped by startNewChat, AND if they came back before
+      // /query committed, openConversation saw no messages on the server.
+      // Re-fetch + re-render so both the user query and the assistant
+      // answer show up. (openConversation increments viewSeq, harmless.)
+      openConversation(data.conversation_id);
     }
-
-    if (data.conversation_id) {
-      currentConversationId = data.conversation_id;
-    }
-    appendMessage("assistant", data.answer, data.sources);
+    // Else: user is in a different conversation. The sidebar got a new row
+    // (via loadConversations above); they can click it to see the answer.
   } catch (e) {
     if (viewSeq === mySeq) {
       appendMessage("assistant", `Network error: ${e.message}`);
