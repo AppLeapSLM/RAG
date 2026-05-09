@@ -506,6 +506,13 @@ const TOKEN_KEY = "appleap_access_token";
 // ── State ────────────────────────────────────
 let currentConversationId = null;
 
+// Increments on every navigation (new chat, open conversation, logout).
+// Each in-flight /query call captures the seq at send time; if the user
+// has navigated away by the time the response lands, the captured seq no
+// longer matches and the response is dropped from the UI (it's still saved
+// server-side under the original conversation).
+let viewSeq = 0;
+
 // ── Auth helpers ─────────────────────────────
 function getToken() { return localStorage.getItem(TOKEN_KEY); }
 function setToken(t) { localStorage.setItem(TOKEN_KEY, t); }
@@ -639,6 +646,7 @@ async function loadConversations() {
 }
 
 async function openConversation(convId) {
+  viewSeq++;
   try {
     const r = await apiFetch(`${API}/conversations/${convId}`);
     if (!r.ok) return;
@@ -671,6 +679,7 @@ async function openConversation(convId) {
 }
 
 function startNewChat() {
+  viewSeq++;
   currentConversationId = null;
   const messagesEl = document.getElementById("messages");
   messagesEl.innerHTML = `
@@ -837,6 +846,12 @@ async function sendQuery() {
   const question = queryInput.value.trim();
   if (!question) return;
 
+  // Snapshot the view seq at send time. If the user navigates away (new
+  // chat / opens another conv) before the response arrives, the snapshot
+  // no longer matches and we suppress the UI render — the answer is still
+  // persisted under the original conversation_id server-side.
+  const mySeq = viewSeq;
+
   queryInput.value = "";
   appendMessage("user", question);
   sendBtn.disabled = true;
@@ -857,24 +872,37 @@ async function sendQuery() {
 
     if (!r.ok) {
       const err = await r.json().catch(() => ({ detail: r.statusText }));
-      appendMessage("assistant", `Error: ${err.detail || r.statusText}`);
+      if (viewSeq === mySeq) {
+        appendMessage("assistant", `Error: ${err.detail || r.statusText}`);
+      }
       return;
     }
 
     const data = await r.json();
 
-    // Track the conversation ID (auto-created on first query)
-    if (data.conversation_id) {
-      currentConversationId = data.conversation_id;
-      loadConversations();
+    // Sidebar always refreshes — the new conversation should appear in the
+    // list regardless of whether the user is still viewing it.
+    loadConversations();
+
+    if (viewSeq !== mySeq) {
+      // User navigated away. Drop the UI render; the conversation row in
+      // the sidebar will let them reopen it to see the answer.
+      return;
     }
 
+    if (data.conversation_id) {
+      currentConversationId = data.conversation_id;
+    }
     appendMessage("assistant", data.answer, data.sources);
   } catch (e) {
-    appendMessage("assistant", `Network error: ${e.message}`);
+    if (viewSeq === mySeq) {
+      appendMessage("assistant", `Network error: ${e.message}`);
+    }
   } finally {
-    sendBtn.disabled = false;
-    thinkingEl.classList.remove("visible");
+    if (viewSeq === mySeq) {
+      sendBtn.disabled = false;
+      thinkingEl.classList.remove("visible");
+    }
   }
 }
 
