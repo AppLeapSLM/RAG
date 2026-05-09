@@ -66,8 +66,12 @@ def _build_acl_clauses(
         f"NOT jsonb_exists({chunk_table}.metadata, 'acl')",
         # Explicit public flag
         f"({chunk_table}.metadata->'acl'->>'public') = 'true'",
-        # User explicitly listed
-        f"({chunk_table}.metadata->'acl'->'allow_users') @> to_jsonb(:acl_user)",
+        # User explicitly listed.
+        # cast(:name AS text) — NOT :name::text — because `::` immediately
+        # after `:name` defeats SA's text() placeholder regex. And the cast
+        # is required: to_jsonb() is polymorphic and asyncpg ships untyped
+        # params as `unknown`, which Postgres can't dispatch on.
+        f"({chunk_table}.metadata->'acl'->'allow_users') @> to_jsonb(cast(:acl_user AS text))",
     ]
     params: dict[str, object] = {"acl_user": user_email.lower()}
 
@@ -79,7 +83,7 @@ def _build_acl_clauses(
 
     if domain:
         clauses.append(
-            f"({chunk_table}.metadata->'acl'->'allow_domains') @> to_jsonb(:acl_domain)"
+            f"({chunk_table}.metadata->'acl'->'allow_domains') @> to_jsonb(cast(:acl_domain AS text))"
         )
         params["acl_domain"] = domain
 
