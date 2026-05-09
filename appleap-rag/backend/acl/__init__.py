@@ -52,28 +52,34 @@ def _build_acl_clauses(
     Returns the list of SQL strings (not yet OR-joined) and a params dict so
     callers can either wrap in text() with bindparams or interpolate into raw
     SQL directly.
+
+    Uses jsonb_exists / jsonb_exists_any function forms instead of the `?`
+    and `?|` operators — `?` collides with DBAPI's positional-placeholder
+    syntax inside SQLAlchemy text() and silently breaks parameter binding.
+    No `::text` casts on bind params for the same reason: `:name::cast`
+    fails SA's `:name` regex (negative lookahead for `:`).
     """
     domain = user_email.split("@", 1)[1].lower() if "@" in user_email else ""
 
     clauses: list[str] = [
         # No ACL key = public corpus default (don't break pre-connector data)
-        f"NOT ({chunk_table}.metadata ? 'acl')",
+        f"NOT jsonb_exists({chunk_table}.metadata, 'acl')",
         # Explicit public flag
         f"({chunk_table}.metadata->'acl'->>'public') = 'true'",
         # User explicitly listed
-        f"({chunk_table}.metadata->'acl'->'allow_users') @> to_jsonb(:acl_user::text)",
+        f"({chunk_table}.metadata->'acl'->'allow_users') @> to_jsonb(:acl_user)",
     ]
     params: dict[str, object] = {"acl_user": user_email.lower()}
 
     if user_groups:
         clauses.append(
-            f"({chunk_table}.metadata->'acl'->'allow_groups') ?| :acl_groups"
+            f"jsonb_exists_any({chunk_table}.metadata->'acl'->'allow_groups', :acl_groups)"
         )
         params["acl_groups"] = user_groups
 
     if domain:
         clauses.append(
-            f"({chunk_table}.metadata->'acl'->'allow_domains') @> to_jsonb(:acl_domain::text)"
+            f"({chunk_table}.metadata->'acl'->'allow_domains') @> to_jsonb(:acl_domain)"
         )
         params["acl_domain"] = domain
 
