@@ -513,6 +513,12 @@ let currentConversationId = null;
 // server-side under the original conversation).
 let viewSeq = 0;
 
+// Conversations with a /query still generating. Lets openConversation
+// repaint the in-flight UI (user message + spinner + disabled send) when
+// the user navigates back to a conversation that's still thinking.
+//   key: conversation_id, value: { question, mySeq }
+const inflightByConv = new Map();
+
 // ── Auth helpers ─────────────────────────────
 function getToken() { return localStorage.getItem(TOKEN_KEY); }
 function setToken(t) { localStorage.setItem(TOKEN_KEY, t); }
@@ -665,7 +671,31 @@ async function openConversation(convId) {
       appendMessage(msg.role, msg.content, msg.sources);
     }
 
-    if (conv.messages.length === 0) {
+    // Restore in-flight UI if there's still a /query generating against
+    // this conversation. Skip restoration if /query has actually committed
+    // already (last two server messages = our user question + assistant
+    // response) — that's a benign race where the response was committed
+    // server-side just before we fetched.
+    const inflight = inflightByConv.get(convId);
+    let restoredInflight = false;
+    if (inflight) {
+      const last = conv.messages[conv.messages.length - 1];
+      const second = conv.messages[conv.messages.length - 2];
+      const alreadyCommitted = !!(
+        last && last.role === "assistant" &&
+        second && second.role === "user" && second.content === inflight.question
+      );
+      if (alreadyCommitted) {
+        inflightByConv.delete(convId);
+      } else {
+        appendMessage("user", inflight.question);
+        thinkingEl.classList.add("visible");
+        sendBtn.disabled = true;
+        restoredInflight = true;
+      }
+    }
+
+    if (conv.messages.length === 0 && !restoredInflight) {
       appendMessage("assistant", "Hi! Ask me anything about your documents. Click the paperclip to attach a file to this conversation.");
     }
 
@@ -859,12 +889,19 @@ async function sendQuery() {
   // no longer matches and we suppress the UI render — the answer is still
   // persisted under the original conversation_id server-side.
   const mySeq = viewSeq;
+  // Track which conv this query is for. Updated after response if it
+  // started as a brand-new chat (no id yet).
+  let myConvId = currentConversationId;
 
   queryInput.value = "";
   appendMessage("user", question);
   sendBtn.disabled = true;
   thinkingEl.classList.add("visible");
   messagesEl.scrollTop = messagesEl.scrollHeight;
+
+  // Register as in-flight so openConversation can restore the UI on
+  // navigate-back. New chats have no id yet — register after the response.
+  if (myConvId) inflightByConv.set(myConvId, { question, mySeq });
 
   try {
     const body = { question };
@@ -887,6 +924,12 @@ async function sendQuery() {
     }
 
     const data = await r.json();
+
+    // For brand-new chats, learn the conv id now so finally can clean up
+    // the inflight map by the right key.
+    if (!myConvId && data.conversation_id) {
+      myConvId = data.conversation_id;
+    }
 
     // Sidebar always refreshes — the new conversation should appear in the
     // list regardless of whether the user is still viewing it.
@@ -912,6 +955,7 @@ async function sendQuery() {
       appendMessage("assistant", `Network error: ${e.message}`);
     }
   } finally {
+    if (myConvId) inflightByConv.delete(myConvId);
     if (viewSeq === mySeq) {
       sendBtn.disabled = false;
       thinkingEl.classList.remove("visible");
