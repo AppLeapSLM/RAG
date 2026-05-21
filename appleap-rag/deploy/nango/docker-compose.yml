@@ -40,6 +40,11 @@ services:
       NANGO_PUBLIC_CONNECT_URL: ${NANGO_PUBLIC_CONNECT_URL}
       FLAG_SERVE_CONNECT_UI: "true"
       NANGO_CONNECT_UI_PORT: "3009"
+      # Enables the "scripts" feature flag, which unlocks deploying pre-built
+      # Sync scripts (otherwise the UI greys out the Deploy button). The flag
+      # is a plain env-var check in Nango's source — no license validation —
+      # so flipping it on a self-host stays within ELv2 (internal use only).
+      NANGO_ENTERPRISE: "true"
       NANGO_SERVER_WEBSOCKETS_PATH: ""
       LOG_LEVEL: info
     depends_on:
