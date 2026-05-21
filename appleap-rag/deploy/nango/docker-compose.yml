@@ -25,7 +25,12 @@ services:
       NANGO_DB_PASSWORD: ${NANGO_DB_PASSWORD}
       NANGO_DB_NAME: nango
       NANGO_ENCRYPTION_KEY: ${NANGO_ENCRYPTION_KEY}        # base64-encoded 32 bytes
-      NANGO_SERVER_URL: ${NANGO_SERVER_URL}                # public URL via Cloudflare Tunnel
+      NANGO_SERVER_URL: ${NANGO_SERVER_URL}                # API origin (public URL via Cloudflare Tunnel)
+      # Frontend/dashboard origin. SEPARATE from NANGO_SERVER_URL — defaults
+      # to http://localhost:3000, which breaks OAuth completion (browser
+      # can't reach the user's localhost after Google's redirect). For a
+      # single-origin deployment we point both at the same hostname.
+      NANGO_PUBLIC_SERVER_URL: ${NANGO_SERVER_URL}
       NANGO_SERVER_WEBSOCKETS_PATH: ""
       LOG_LEVEL: info
     depends_on:
