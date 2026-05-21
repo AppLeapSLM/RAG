@@ -16,8 +16,10 @@ services:
     image: nangohq/nango-server:hosted
     restart: unless-stopped
     ports:
-      - "127.0.0.1:3003:8080"   # host:3003 -> container:8080 (Nango listens on 8080).
-                                # Bound to localhost; Cloudflare Tunnel exposes it publicly.
+      - "127.0.0.1:3003:8080"   # Dashboard / API (Nango listens on 8080 inside).
+      - "127.0.0.1:3009:3009"   # Connect UI (the OAuth popup origin — served
+                                # by the same container when FLAG_SERVE_CONNECT_UI=true).
+                                # Both bound to localhost; Cloudflare Tunnel exposes them.
     environment:
       NANGO_DB_HOST: nango-db
       NANGO_DB_PORT: "5432"
@@ -31,6 +33,13 @@ services:
       # can't reach the user's localhost after Google's redirect). For a
       # single-origin deployment we point both at the same hostname.
       NANGO_PUBLIC_SERVER_URL: ${NANGO_SERVER_URL}
+      # Connect UI public origin — yet another URL knob. Defaults to
+      # http://localhost:3009 (the Connect UI's internal port), which fails
+      # in the browser on a remote VM. Set to a Cloudflare-fronted hostname
+      # that tunnels to localhost:3009 on the VM.
+      NANGO_PUBLIC_CONNECT_URL: ${NANGO_PUBLIC_CONNECT_URL}
+      FLAG_SERVE_CONNECT_UI: "true"
+      NANGO_CONNECT_UI_PORT: "3009"
       NANGO_SERVER_WEBSOCKETS_PATH: ""
       LOG_LEVEL: info
     depends_on:
