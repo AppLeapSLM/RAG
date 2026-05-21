@@ -286,6 +286,26 @@
   }
   .thinking.visible { display: block; }
 
+  /* Blinking caret while a message is streaming */
+  .message.streaming .caret {
+    display: inline-block;
+    margin-left: 2px;
+    color: #2563EB;
+    animation: caret-blink 1s steps(1, end) infinite;
+  }
+  @keyframes caret-blink { 50% { opacity: 0; } }
+
+  /* Error indicator for an interrupted / failed generation */
+  .stream-error {
+    margin-top: 8px;
+    padding: 8px 10px;
+    background: #fef2f2;
+    border: 1px solid #fecaca;
+    border-radius: 6px;
+    color: #991b1b;
+    font-size: 12px;
+  }
+
   /* ── Input bar ──────────────────────────────── */
   .input-bar {
     padding: 16px 24px;
@@ -507,17 +527,10 @@ const TOKEN_KEY = "appleap_access_token";
 let currentConversationId = null;
 
 // Increments on every navigation (new chat, open conversation, logout).
-// Each in-flight /query call captures the seq at send time; if the user
-// has navigated away by the time the response lands, the captured seq no
-// longer matches and the response is dropped from the UI (it's still saved
-// server-side under the original conversation).
+// Streaming readers compare against this to drop UI updates if the user
+// has moved on (generation keeps running server-side — see /messages/{id}/stream
+// for resume).
 let viewSeq = 0;
-
-// Conversations with a /query still generating. Lets openConversation
-// repaint the in-flight UI (user message + spinner + disabled send) when
-// the user navigates back to a conversation that's still thinking.
-//   key: conversation_id, value: { question, mySeq }
-const inflightByConv = new Map();
 
 // ── Auth helpers ─────────────────────────────
 function getToken() { return localStorage.getItem(TOKEN_KEY); }
@@ -653,59 +666,56 @@ async function loadConversations() {
 
 async function openConversation(convId) {
   viewSeq++;
-  // Reset the (global) spinner UI on every navigation. Any in-flight
-  // /query whose mySeq is now stale won't touch sendBtn/thinking in its
-  // finally because of the seq-match guard.
+  const mySeq = viewSeq;
+  // Reset the spinner UI on every navigation. Streaming readers check
+  // viewSeq before touching the UI, so stale ones won't fight us.
   sendBtn.disabled = false;
   thinkingEl.classList.remove("visible");
   try {
     const r = await apiFetch(`${API}/conversations/${convId}`);
     if (!r.ok) return;
     const conv = await r.json();
+    if (viewSeq !== mySeq) return;  // user navigated again while we were loading
 
     currentConversationId = convId;
     const messagesEl = document.getElementById("messages");
     messagesEl.innerHTML = "";
 
+    // Skip rendering the one assistant message that is mid-generation —
+    // we'll attach to its live stream below. Everything else (user
+    // messages, completed assistants, errored assistants) renders normally.
     for (const msg of conv.messages) {
-      appendMessage(msg.role, msg.content, msg.sources);
+      if (msg.role === "assistant" && msg.status === "streaming") continue;
+      appendMessage(msg.role, msg.content, msg.sources, {
+        status: msg.status,
+        error_text: msg.error_text,
+      });
     }
 
-    // Restore in-flight UI if there's still a /query generating against
-    // this conversation. Skip restoration if /query has actually committed
-    // already (last two server messages = our user question + assistant
-    // response) — that's a benign race where the response was committed
-    // server-side just before we fetched.
-    const inflight = inflightByConv.get(convId);
-    let restoredInflight = false;
-    if (inflight) {
-      const last = conv.messages[conv.messages.length - 1];
-      const second = conv.messages[conv.messages.length - 2];
-      const alreadyCommitted = !!(
-        last && last.role === "assistant" &&
-        second && second.role === "user" && second.content === inflight.question
-      );
-      if (alreadyCommitted) {
-        inflightByConv.delete(convId);
-      } else {
-        appendMessage("user", inflight.question);
-        thinkingEl.classList.add("visible");
-        sendBtn.disabled = true;
-        restoredInflight = true;
-      }
-    }
-
-    if (conv.messages.length === 0 && !restoredInflight) {
+    if (conv.messages.length === 0 && !conv.streaming_message_id) {
       appendMessage("assistant", "Hi! Ask me anything about your documents. Click the paperclip to attach a file to this conversation.");
     }
 
-    // Highlight active chat in sidebar
     document.querySelectorAll(".chat-item").forEach(item => {
       item.classList.toggle("active", item.dataset.id === convId);
     });
 
-    // Show this conversation's attachments as chips
     loadAttachments(convId);
+
+    // Live-stream resume: server says generation is still in flight for
+    // this conversation. Subscribe and render deltas into a fresh bubble.
+    if (conv.streaming_message_id) {
+      thinkingEl.classList.add("visible");
+      sendBtn.disabled = true;
+      const bubble = appendStreamingBubble();
+      streamExistingMessage(conv.streaming_message_id, bubble, mySeq)
+        .finally(() => {
+          if (viewSeq === mySeq) {
+            sendBtn.disabled = false;
+            thinkingEl.classList.remove("visible");
+          }
+        });
+    }
 
     messagesEl.scrollTop = messagesEl.scrollHeight;
   } catch (e) {
@@ -884,14 +894,7 @@ async function sendQuery() {
   const question = queryInput.value.trim();
   if (!question) return;
 
-  // Snapshot the view seq at send time. If the user navigates away (new
-  // chat / opens another conv) before the response arrives, the snapshot
-  // no longer matches and we suppress the UI render — the answer is still
-  // persisted under the original conversation_id server-side.
   const mySeq = viewSeq;
-  // Track which conv this query is for. Updated after response if it
-  // started as a brand-new chat (no id yet).
-  let myConvId = currentConversationId;
 
   queryInput.value = "";
   appendMessage("user", question);
@@ -899,63 +902,72 @@ async function sendQuery() {
   thinkingEl.classList.add("visible");
   messagesEl.scrollTop = messagesEl.scrollHeight;
 
-  // Register as in-flight so openConversation can restore the UI on
-  // navigate-back. New chats have no id yet — register after the response.
-  if (myConvId) inflightByConv.set(myConvId, { question, mySeq });
+  const bubble = appendStreamingBubble();
 
   try {
     const body = { question };
-    if (currentConversationId) {
-      body.conversation_id = currentConversationId;
-    }
+    if (currentConversationId) body.conversation_id = currentConversationId;
 
     const r = await apiFetch(`${API}/query`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
       body: JSON.stringify(body),
     });
 
     if (!r.ok) {
       const err = await r.json().catch(() => ({ detail: r.statusText }));
       if (viewSeq === mySeq) {
-        appendMessage("assistant", `Error: ${err.detail || r.statusText}`);
+        replaceStreamingBubbleWithError(bubble, `Error: ${err.detail || r.statusText}`);
+      } else {
+        bubble.remove();
       }
       return;
     }
 
-    const data = await r.json();
+    let sources = [];
+    let convIdFromStream = null;
 
-    // For brand-new chats, learn the conv id now so finally can clean up
-    // the inflight map by the right key.
-    if (!myConvId && data.conversation_id) {
-      myConvId = data.conversation_id;
+    for await (const { event, data } of sseEvents(r)) {
+      if (event === "start") {
+        sources = data.sources || [];
+        convIdFromStream = data.conversation_id;
+        // For brand-new chats, learn the conv id immediately so subsequent
+        // attach / send calls thread the right conversation.
+        if (viewSeq === mySeq && !currentConversationId && convIdFromStream) {
+          currentConversationId = convIdFromStream;
+        }
+        // Refresh sidebar so the new chat appears in the list (even if
+        // the user has navigated away, the title is set on the server).
+        loadConversations();
+      } else if (event === "delta") {
+        if (viewSeq === mySeq) {
+          appendStreamingText(bubble, data.text);
+          messagesEl.scrollTop = messagesEl.scrollHeight;
+        }
+      } else if (event === "done") {
+        if (viewSeq === mySeq) {
+          finalizeStreamingBubble(bubble, sources);
+        } else {
+          bubble.remove();
+        }
+        loadConversations();
+        return;
+      } else if (event === "error") {
+        if (viewSeq === mySeq) {
+          appendStreamingErrorLine(bubble, data.error || "Generation failed");
+        } else {
+          bubble.remove();
+        }
+        return;
+      }
     }
-
-    // Sidebar always refreshes — the new conversation should appear in the
-    // list regardless of whether the user is still viewing it.
-    loadConversations();
-
-    if (viewSeq === mySeq) {
-      // Same view, render locally.
-      if (data.conversation_id) currentConversationId = data.conversation_id;
-      appendMessage("assistant", data.answer, data.sources);
-    } else if (data.conversation_id && currentConversationId === data.conversation_id) {
-      // The user navigated away (e.g., New Chat) and then back to the
-      // conversation this query was for. Their locally-rendered user
-      // message was wiped by startNewChat, AND if they came back before
-      // /query committed, openConversation saw no messages on the server.
-      // Re-fetch + re-render so both the user query and the assistant
-      // answer show up. (openConversation increments viewSeq, harmless.)
-      openConversation(data.conversation_id);
-    }
-    // Else: user is in a different conversation. The sidebar got a new row
-    // (via loadConversations above); they can click it to see the answer.
   } catch (e) {
     if (viewSeq === mySeq) {
-      appendMessage("assistant", `Network error: ${e.message}`);
+      appendStreamingErrorLine(bubble, `Network error: ${e.message}`);
+    } else {
+      bubble.remove();
     }
   } finally {
-    if (myConvId) inflightByConv.delete(myConvId);
     if (viewSeq === mySeq) {
       sendBtn.disabled = false;
       thinkingEl.classList.remove("visible");
@@ -963,7 +975,121 @@ async function sendQuery() {
   }
 }
 
-function appendMessage(role, text, sources) {
+async function streamExistingMessage(messageId, bubble, mySeq) {
+  try {
+    const r = await apiFetch(`${API}/messages/${messageId}/stream`, {
+      headers: { "Accept": "text/event-stream" },
+    });
+    if (!r.ok) return;
+    let sources = [];
+    for await (const { event, data } of sseEvents(r)) {
+      if (viewSeq !== mySeq) return;  // user navigated away; bubble is stale
+      if (event === "snapshot") {
+        sources = data.sources || [];
+        setStreamingText(bubble, data.text || "");
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        // status==completed/error means the stream is already terminal —
+        // the matching done/error event follows immediately. No special
+        // handling needed here.
+      } else if (event === "delta") {
+        appendStreamingText(bubble, data.text);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      } else if (event === "done") {
+        finalizeStreamingBubble(bubble, sources);
+        return;
+      } else if (event === "error") {
+        appendStreamingErrorLine(bubble, data.error || "Generation failed");
+        return;
+      }
+    }
+  } catch (e) {
+    if (viewSeq === mySeq) {
+      appendStreamingErrorLine(bubble, `Network error: ${e.message}`);
+    }
+  }
+}
+
+// ── SSE reader: yields {event, data} parsed from a streaming Response. ──
+async function* sseEvents(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) !== -1) {
+        const frame = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        if (!frame.trim()) continue;
+        let event = "message", dataStr = "";
+        for (const line of frame.split("\n")) {
+          if (line.startsWith("event: ")) event = line.slice(7).trim();
+          else if (line.startsWith("data: ")) dataStr += line.slice(6);
+        }
+        let data = null;
+        try { data = JSON.parse(dataStr); } catch {}
+        yield { event, data };
+      }
+    }
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+}
+
+// ── Streaming bubble helpers ─────────────────────────────────────
+function appendStreamingBubble() {
+  const div = document.createElement("div");
+  div.className = "message assistant streaming";
+  div.innerHTML = `<div class="bubble"><span class="stream-text"></span><span class="caret">▋</span></div>`;
+  messagesEl.appendChild(div);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return div;
+}
+
+function setStreamingText(bubble, text) {
+  const span = bubble.querySelector(".stream-text");
+  if (span) span.textContent = text;
+}
+
+function appendStreamingText(bubble, text) {
+  const span = bubble.querySelector(".stream-text");
+  if (span) span.textContent += text;
+}
+
+function finalizeStreamingBubble(bubble, sources) {
+  bubble.classList.remove("streaming");
+  const caret = bubble.querySelector(".caret");
+  if (caret) caret.remove();
+  if (sources && sources.length > 0) {
+    const sourceText = sources.map((s, i) =>
+      `[${i + 1}] Chunk #${s.chunk_index}\n${s.content_preview}`
+    ).join("\n\n");
+    const details = document.createElement("details");
+    details.className = "sources";
+    details.innerHTML = `<summary>${sources.length} source(s) used</summary><pre>${escapeHtml(sourceText)}</pre>`;
+    bubble.appendChild(details);
+  }
+}
+
+function appendStreamingErrorLine(bubble, errorText) {
+  bubble.classList.remove("streaming");
+  const caret = bubble.querySelector(".caret");
+  if (caret) caret.remove();
+  const err = document.createElement("div");
+  err.className = "stream-error";
+  err.textContent = `⚠ ${errorText}`;
+  bubble.appendChild(err);
+}
+
+function replaceStreamingBubbleWithError(bubble, text) {
+  bubble.classList.remove("streaming");
+  bubble.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
+}
+
+function appendMessage(role, text, sources, opts) {
   const div = document.createElement("div");
   div.className = `message ${role}`;
 
@@ -974,6 +1100,14 @@ function appendMessage(role, text, sources) {
       `[${i + 1}] Chunk #${s.chunk_index}\n${s.content_preview}`
     ).join("\n\n");
     html += `<details class="sources"><summary>${sources.length} source(s) used</summary><pre>${escapeHtml(sourceText)}</pre></details>`;
+  }
+
+  // Errored historical messages (server-side crash recovery, network drop
+  // mid-stream, etc.) get an inline error line so the user knows what they
+  // see is incomplete.
+  if (opts && opts.status === "error") {
+    const errText = opts.error_text || "Generation was interrupted";
+    html += `<div class="stream-error">⚠ ${escapeHtml(errText)}</div>`;
   }
 
   div.innerHTML = html;

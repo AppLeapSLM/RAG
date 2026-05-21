@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 from collections import defaultdict
+from typing import AsyncIterator
 
 import httpx
 
@@ -256,3 +258,92 @@ async def generate_answer(
     prompt = "\n".join(parts)
 
     return await _llm_generate(SYSTEM_PROMPT, prompt)
+
+
+# ── Streaming generation ───────────────────────────────────────────
+
+
+async def _llm_generate_stream(
+    system: str, prompt: str, model: str | None = None,
+) -> AsyncIterator[str]:
+    """Stream tokens from Ollama. Yields each delta as it arrives.
+
+    Ollama's /api/generate with stream=true returns NDJSON: one JSON
+    object per line, each carrying a `response` field with the next token
+    fragment, plus a final object with done=true and stats.
+    """
+    model = model or settings.llm_model
+
+    async with httpx.AsyncClient(timeout=600.0) as client:
+        async with client.stream(
+            "POST",
+            f"{settings.ollama_base_url}/api/generate",
+            json={
+                "model": model,
+                "system": system,
+                "prompt": prompt,
+                "stream": True,
+                "options": {"num_ctx": settings.llm_num_ctx},
+            },
+        ) as response:
+            response.raise_for_status()
+            final_payload: dict | None = None
+            async for line in response.aiter_lines():
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.warning("llm_generate_stream skip non-json line=%r", line[:200])
+                    continue
+                chunk = payload.get("response", "")
+                if chunk:
+                    yield chunk
+                if payload.get("done"):
+                    final_payload = payload
+                    break
+
+            if final_payload is not None:
+                pt = final_payload.get("prompt_eval_count")
+                et = final_payload.get("eval_count")
+                if pt is not None and pt > 14000:
+                    logger.warning(
+                        "llm_generate_stream prompt_tokens=%d approaching num_ctx=%d (truncation risk)",
+                        pt, settings.llm_num_ctx,
+                    )
+                else:
+                    logger.info(
+                        "llm_generate_stream model=%s num_ctx=%d prompt_tokens=%s eval_tokens=%s",
+                        model, settings.llm_num_ctx, pt, et,
+                    )
+
+
+async def generate_answer_stream(
+    question: str,
+    chunks: list[Chunk],
+    history: list[dict] | None = None,
+    inline_attachments: list | None = None,
+) -> AsyncIterator[str]:
+    """Streaming counterpart of `generate_answer`. Builds the same prompt
+    and yields token deltas as Ollama generates them.
+    """
+    context_block = build_context_block(chunks, inline_attachments=inline_attachments)
+    history_block = build_history_block(history) if history else ""
+
+    parts: list[str] = []
+    if history_block:
+        parts.append(history_block)
+        parts.append("---\n")
+
+    if context_block:
+        parts.append(f"Context from company documents:\n\n{context_block}")
+        parts.append("---\n")
+        parts.append(f"Question: {question}\n\nAnswer:")
+    else:
+        parts.append(f"No company documents were found for this question.\n\n")
+        parts.append(f"Question: {question}\n\nAnswer from your general knowledge:")
+
+    prompt = "\n".join(parts)
+
+    async for delta in _llm_generate_stream(SYSTEM_PROMPT, prompt):
+        yield delta

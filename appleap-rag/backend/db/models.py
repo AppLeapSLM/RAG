@@ -138,6 +138,11 @@ class Message(Base):
     )
     role: Mapped[str] = mapped_column(String, nullable=False)  # "user" | "assistant"
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    # 'streaming' while an assistant message is mid-generation; 'completed'
+    # once the stream ends cleanly; 'error' if generation failed. User
+    # messages are always 'completed' on insert.
+    status: Mapped[str] = mapped_column(String, nullable=False, default="completed")
+    error_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     model_used: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     sources: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     retrieval_scores: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)

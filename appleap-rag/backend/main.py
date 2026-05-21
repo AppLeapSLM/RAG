@@ -1,13 +1,16 @@
+import asyncio
 import json
 import logging
 import os
 import tempfile
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import AsyncIterator
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,10 +27,11 @@ from backend.auth import (
 from backend.chunking.chunker import chunk_parsed_document_async
 from backend.chunking.dispatch import process_file
 from backend.config import settings
-from backend.db.connection import engine, get_session
+from backend.db.connection import async_session, engine, get_session
 from backend.db.models import Base, Chunk, Conversation, ConversationInlineAttachment, Document, Message, User
 from backend.embedding.embedder import embed_batch
-from backend.generation.llm import generate_answer, rewrite_query
+from backend.generation import stream_registry
+from backend.generation.llm import generate_answer_stream, rewrite_query
 from backend.parsing.parser import parse_text
 from backend.retrieval.vector_search import search
 from backend.webhooks.nango import router as nango_webhook_router
@@ -144,6 +148,29 @@ async def lifespan(app: FastAPI):
             ON jobs(run_after)
             WHERE locked_at IS NULL
         """))
+
+        # Streaming-generation columns. Added in V12 alongside SSE /query.
+        # Existing messages predate the column, so default everything to
+        # 'completed' on backfill.
+        await conn.execute(__import__("sqlalchemy").text("""
+            ALTER TABLE messages
+            ADD COLUMN IF NOT EXISTS status VARCHAR(32) NOT NULL DEFAULT 'completed'
+        """))
+        await conn.execute(__import__("sqlalchemy").text("""
+            ALTER TABLE messages
+            ADD COLUMN IF NOT EXISTS error_text TEXT
+        """))
+
+        # Crash recovery: any assistant message still marked 'streaming' from
+        # a previous process is orphaned (in-memory stream registry is gone).
+        # Mark them as errored so clients see a clear signal instead of an
+        # eternal spinner.
+        await conn.execute(__import__("sqlalchemy").text("""
+            UPDATE messages
+            SET status = 'error',
+                error_text = COALESCE(error_text, 'Generation interrupted by server restart')
+            WHERE status = 'streaming'
+        """))
     yield
     await engine.dispose()
 
@@ -185,12 +212,6 @@ class QueryRequest(BaseModel):
     conversation_id: str | None = None
 
 
-class QueryResponse(BaseModel):
-    answer: str
-    sources: list[dict]
-    conversation_id: str
-
-
 class ConversationSummary(BaseModel):
     id: str
     title: str
@@ -205,6 +226,10 @@ class ConversationDetail(BaseModel):
     created_at: str
     updated_at: str
     messages: list[dict]
+    # The id of an assistant message currently being generated server-side
+    # for this conversation, or None. Frontend uses this to reconnect to a
+    # live stream when the user navigates back to a thinking conversation.
+    streaming_message_id: str | None = None
 
 
 class ConversationUpdate(BaseModel):
@@ -539,17 +564,179 @@ async def ingest_file(
             pass
 
 
-@app.post("/query", response_model=QueryResponse)
+def _sse(event: str, data: dict) -> str:
+    """Format one Server-Sent Event frame."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+async def _persist_loop(state: stream_registry.StreamState) -> None:
+    """Snapshot accumulated_text to DB every ~1.5s while generation runs.
+    Exits when state.done_event is set (the main flow does the final save
+    with the terminal status). The 1.5s cadence means a server crash loses
+    at most ~1.5s of generated tokens."""
+    last_persisted_len = 0
+    while True:
+        try:
+            await asyncio.wait_for(state.done_event.wait(), timeout=1.5)
+            return  # done — main flow handles the final save
+        except asyncio.TimeoutError:
+            pass
+        text = state.accumulated_text
+        if len(text) == last_persisted_len:
+            continue
+        try:
+            async with async_session() as s:
+                row = await s.get(Message, state.message_id)
+                if row is not None:
+                    row.content = text
+                    await s.commit()
+            last_persisted_len = len(text)
+        except Exception:
+            # Don't crash the loop on a transient DB error; the next tick
+            # will retry, and the final-save in _run_generation is the
+            # ultimate source of truth.
+            logger.exception("persist_loop write failed message=%s", state.message_id)
+
+
+async def _run_generation(
+    state: stream_registry.StreamState,
+    question: str,
+    chunks: list,
+    history: list[dict],
+    inline_attachments: list,
+    rewritten_query: str,
+) -> None:
+    """Background task: stream tokens from Ollama into the registry, then
+    persist the final answer to the assistant message row. Runs independently
+    of the HTTP request that started it — survives client disconnect."""
+    persist_task = asyncio.create_task(_persist_loop(state))
+    try:
+        async for delta in generate_answer_stream(
+            question, chunks, history=history, inline_attachments=inline_attachments,
+        ):
+            stream_registry.push_delta(state, delta)
+
+        async with async_session() as s:
+            row = await s.get(Message, state.message_id)
+            if row is not None:
+                row.content = state.accumulated_text
+                row.status = "completed"
+                if rewritten_query != question:
+                    row.metadata_ = {"rewritten_query": rewritten_query}
+                await s.commit()
+        stream_registry.finish(state)
+    except Exception as exc:
+        logger.exception("generation_failed message=%s", state.message_id)
+        try:
+            async with async_session() as s:
+                row = await s.get(Message, state.message_id)
+                if row is not None:
+                    row.content = state.accumulated_text  # save partial
+                    row.status = "error"
+                    row.error_text = str(exc)
+                    await s.commit()
+        except Exception:
+            logger.exception("error_persist_failed message=%s", state.message_id)
+        stream_registry.finish(state, error=str(exc))
+    finally:
+        # done_event is set by finish(); persist_loop exits on its own.
+        try:
+            await persist_task
+        except Exception:
+            logger.exception("persist_task failed message=%s", state.message_id)
+        # Keep terminal state in the registry briefly so late subscribers
+        # can get the synthesized done event, then drop it.
+        await asyncio.sleep(30)
+        stream_registry.remove(state.message_id)
+
+
+async def _stream_existing(state: stream_registry.StreamState) -> AsyncIterator[str]:
+    """SSE generator that resumes an in-flight stream. Sends a snapshot of
+    accumulated text first, then drains new deltas until done/error."""
+    text, status, q = stream_registry.subscribe_with_snapshot(state)
+    try:
+        yield _sse("snapshot", {
+            "conversation_id": state.conversation_id,
+            "message_id": state.message_id,
+            "sources": state.sources,
+            "text": text,
+            "status": status,
+        })
+        while True:
+            event = await q.get()
+            if event["type"] == "delta":
+                yield _sse("delta", {"text": event["text"]})
+            elif event["type"] == "done":
+                err = event.get("error")
+                if err:
+                    yield _sse("error", {"error": err})
+                else:
+                    yield _sse("done", {})
+                return
+    finally:
+        stream_registry.unsubscribe(state, q)
+
+
+async def _stream_fresh(
+    state: stream_registry.StreamState,
+) -> AsyncIterator[str]:
+    """SSE generator for a brand-new /query stream. Emits `start` (with
+    conversation_id, message_id, sources) first, then deltas as the
+    background producer pushes them."""
+    text, status, q = stream_registry.subscribe_with_snapshot(state)
+    try:
+        yield _sse("start", {
+            "conversation_id": state.conversation_id,
+            "message_id": state.message_id,
+            "sources": state.sources,
+        })
+        # If anything was generated before subscribe (race-tolerant — usually
+        # empty since we subscribe before the producer task gets to run),
+        # flush it as a delta so the client renders it.
+        if text:
+            yield _sse("delta", {"text": text})
+        if status != "streaming":
+            err = state.error_text if status == "error" else None
+            if err:
+                yield _sse("error", {"error": err})
+            else:
+                yield _sse("done", {})
+            return
+        while True:
+            event = await q.get()
+            if event["type"] == "delta":
+                yield _sse("delta", {"text": event["text"]})
+            elif event["type"] == "done":
+                err = event.get("error")
+                if err:
+                    yield _sse("error", {"error": err})
+                else:
+                    yield _sse("done", {})
+                return
+    finally:
+        stream_registry.unsubscribe(state, q)
+
+
+@app.post("/query")
 async def query(
     req: QueryRequest,
     session: AsyncSession = Depends(get_session),
     user: AuthedUser = Depends(require_user),
 ):
-    """Answer a question using retrieved context, with conversation memory.
+    """Stream a grounded answer back as Server-Sent Events.
 
-    If conversation_id is provided, the caller MUST own it (404 otherwise).
-    If omitted, a new conversation is auto-created and owned by the caller.
-    The authenticated user's email drives ACL filtering on retrieved chunks.
+    Event sequence on success:
+      event: start    data: {conversation_id, message_id, sources}
+      event: delta    data: {text}             (repeated)
+      event: done     data: {}
+
+    On error mid-stream:
+      event: error    data: {error: "..."}
+
+    The HTTP request can disconnect at any time; generation continues
+    server-side and is persisted. Reconnect via GET /messages/{id}/stream.
+
+    Ownership: if `conversation_id` is provided, the caller MUST own it.
     """
     from sqlalchemy import select as sa_select
 
@@ -569,7 +756,6 @@ async def query(
             .order_by(Message.created_at)
         )
     ).scalars().all()
-
     history = [{"role": m.role, "content": m.content} for m in rows]
 
     # 2b. Load inline attachments for this conversation (prepended to context).
@@ -595,8 +781,7 @@ async def query(
     # 3. Rewrite query using history (resolves pronouns, references)
     search_query = await rewrite_query(req.question, history)
 
-    # 4. Retrieve relevant chunks — corpus + this conv's chunked attachments.
-    #    user.email drives ACL filtering; sourced from the JWT, never headers.
+    # 4. Retrieve relevant chunks
     results = await search(
         search_query,
         session,
@@ -605,15 +790,7 @@ async def query(
         user_email=user.email,
     )
 
-    # 5. Generate answer with full history + inline attachments + retrieved chunks
-    answer = await generate_answer(
-        req.question,
-        results,
-        history=history,
-        inline_attachments=inline_attachments,
-    )
-
-    # 6. Build source metadata
+    # 5. Build source metadata
     sources = [
         {
             "chunk_id": r.id,
@@ -624,38 +801,108 @@ async def query(
         for r in results
     ]
 
-    # 7. Store user message
+    # 6. Persist user message + empty assistant message (status='streaming')
+    #    immediately so the row exists for late subscribers / resume.
+    assistant_msg_id = str(uuid.uuid4())
     user_msg = Message(
         conversation_id=conv.id,
         role="user",
         content=req.question,
     )
-    session.add(user_msg)
-
-    # 8. Store assistant message with retrieval metadata
     assistant_msg = Message(
+        id=assistant_msg_id,
         conversation_id=conv.id,
         role="assistant",
-        content=answer,
+        content="",
+        status="streaming",
         model_used=settings.llm_model,
         sources=sources,
-        metadata_={"rewritten_query": search_query} if search_query != req.question else {},
     )
+    session.add(user_msg)
     session.add(assistant_msg)
 
-    # 9. Auto-title conversation from first user question
     if conv.title == "New Chat":
         conv.title = req.question[:100]
-
-    # 10. Update conversation timestamp
     conv.updated_at = datetime.now(timezone.utc)
-
     await session.commit()
 
-    return QueryResponse(
-        answer=answer,
-        sources=sources,
-        conversation_id=conv.id,
+    # 7. Register the stream + spawn background generation. The task is
+    #    intentionally NOT tied to the request lifecycle — it survives
+    #    client disconnect so the answer always completes.
+    state = stream_registry.register(assistant_msg_id, conv.id, sources)
+    asyncio.create_task(_run_generation(
+        state=state,
+        question=req.question,
+        chunks=results,
+        history=history,
+        inline_attachments=inline_attachments,
+        rewritten_query=search_query,
+    ))
+
+    return StreamingResponse(
+        _stream_fresh(state),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",  # disable nginx-style buffering
+        },
+    )
+
+
+@app.get("/messages/{message_id}/stream")
+async def stream_message(
+    message_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: AuthedUser = Depends(require_user),
+):
+    """Reconnect to an in-flight stream, or replay a finished message.
+
+    Ownership: 404 unless the message's conversation belongs to the caller.
+
+    If the message is still being generated server-side, subscribe to live
+    deltas. Otherwise emit a single snapshot + done/error so the frontend
+    has one code path."""
+    msg = await session.get(Message, message_id)
+    if msg is None:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    conv = await session.get(Conversation, msg.conversation_id)
+    if conv is None or conv.owner_user_id != user.id:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    state = stream_registry.get(message_id)
+    if state is not None:
+        return StreamingResponse(
+            _stream_existing(state),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # Not in registry — generation is over (clean, errored, or lost to
+    # restart). Replay from DB.
+    async def _replay() -> AsyncIterator[str]:
+        yield _sse("snapshot", {
+            "conversation_id": msg.conversation_id,
+            "message_id": msg.id,
+            "sources": msg.sources or [],
+            "text": msg.content,
+            "status": msg.status,
+        })
+        if msg.status == "error":
+            yield _sse("error", {"error": msg.error_text or "Generation failed"})
+        else:
+            yield _sse("done", {})
+
+    return StreamingResponse(
+        _replay(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
@@ -740,6 +987,8 @@ async def get_conversation(
             "id": m.id,
             "role": m.role,
             "content": m.content,
+            "status": m.status,
+            "error_text": m.error_text,
             "model_used": m.model_used,
             "sources": m.sources,
             "created_at": m.created_at.isoformat(),
@@ -747,12 +996,16 @@ async def get_conversation(
         for m in rows
     ]
 
+    in_flight = stream_registry.get_streaming_for_conversation(conv.id)
+    streaming_message_id = in_flight.message_id if in_flight is not None else None
+
     return ConversationDetail(
         id=conv.id,
         title=conv.title,
         created_at=conv.created_at.isoformat(),
         updated_at=conv.updated_at.isoformat(),
         messages=messages,
+        streaming_message_id=streaming_message_id,
     )
 
 
