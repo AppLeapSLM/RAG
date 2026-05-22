@@ -800,10 +800,30 @@ async def query(
                 conv.id, len(inline_attachments), total_inline_bytes,
             )
 
+    # 2c. Filenames of chunked attachments for this conv. Titles only — the
+    #     full chunks still go through retrieval. We pass these into the
+    #     rewriter so it can resolve "this doc" / "the attached file" to a
+    #     real filename before retrieval runs.
+    chunked_attachment_rows = (
+        await session.execute(
+            sa_select(Document)
+            .where(Document.source_type == "attachment")
+            .where(Document.conversation_id == conv.id)
+            .order_by(Document.created_at)
+        )
+    ).scalars().all()
+    attachment_filenames = (
+        [a.filename for a in inline_attachments]
+        + [d.title for d in chunked_attachment_rows]
+    )
+
     # 3. Decide: answer the follow-up, or ask a clarifying question?
-    #    The rewrite LLM call is already on the hot path for turns 2+;
-    #    we piggyback the clarity decision on it. Turn 1 always proceeds.
-    mode, payload = await rewrite_query(req.question, history)
+    #    Rewrite fires when there's history OR attached files — both
+    #    introduce references the model needs to resolve before retrieval.
+    #    Cold path with neither stays LLM-free.
+    mode, payload = await rewrite_query(
+        req.question, history, attachment_filenames=attachment_filenames,
+    )
 
     if mode == "clarify":
         # No retrieval, no background generation. Persist the user message

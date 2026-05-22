@@ -115,7 +115,9 @@ def _format_history_for_rewrite(history: list[dict]) -> str:
 
 
 async def rewrite_query(
-    question: str, history: list[dict],
+    question: str,
+    history: list[dict],
+    attachment_filenames: list[str] | None = None,
 ) -> tuple[str, str]:
     """Decide whether the follow-up is answerable or needs clarification,
     and return one of:
@@ -123,21 +125,32 @@ async def rewrite_query(
       ("query",   <self-contained rewritten question>)  → proceed to retrieval
       ("clarify", <question to ask the user>)            → skip retrieval, stop
 
-    Turn 1 (no history) always returns ("query", question) unchanged —
-    clarification on a brand-new turn is out of scope to avoid adding an
-    LLM call to the cold path.
+    Cold path (no history AND no attachments) returns ("query", question)
+    unchanged — no LLM call, fastest UX. As soon as either history exists
+    or files are attached to the conversation, we pay the rewrite call so
+    the model can resolve references like "this doc" to the actual filename
+    before retrieval runs.
 
     If the LLM ignores the QUERY:/CLARIFY: format, the response is treated
     as ("query", raw_response) so behavior degrades gracefully to the
     pre-clarification baseline rather than blocking the user.
     """
-    if not history:
+    attachment_filenames = attachment_filenames or []
+    if not history and not attachment_filenames:
         return ("query", question)
 
-    history_text = _format_history_for_rewrite(history)
+    history_text = (
+        _format_history_for_rewrite(history) if history else "(no prior turns)"
+    )
+
+    attachment_block = ""
+    if attachment_filenames:
+        names = "\n".join(f"- {fn}" for fn in attachment_filenames)
+        attachment_block = f"\n\nFiles attached to this conversation:\n{names}"
 
     prompt = (
-        f"Conversation history:\n{history_text}\n\n"
+        f"Conversation history:\n{history_text}"
+        f"{attachment_block}\n\n"
         f"Follow-up question: {question}\n\n"
         f"Your output:"
     )
