@@ -31,15 +31,28 @@ SYSTEM_PROMPT = (
 )
 
 REWRITE_PROMPT = (
-    "You are a query rewriter for an IT operations RAG system. "
-    "Given a conversation history and the user's latest follow-up question, "
-    "rewrite the follow-up into a fully self-contained standalone question "
-    "that captures all necessary context from the conversation.\n\n"
+    "You are a query interpreter for an IT operations RAG system. Given a "
+    "conversation history and the user's latest follow-up, you must decide "
+    "whether the follow-up can be answered as-is (after pronoun resolution) "
+    "or whether it is too vague / ambiguous to answer confidently. Output "
+    "EXACTLY ONE line, starting with one of the two prefixes:\n\n"
+    "QUERY: <a fully self-contained standalone question, with pronouns "
+    "resolved and needed context folded in from the history>\n"
+    "CLARIFY: <one short, focused question to ask the user — at most one "
+    "sentence — when the follow-up is genuinely ambiguous or missing a "
+    "required entity (e.g., which service, which environment, which time "
+    "range)>\n\n"
     "RULES:\n"
-    "- Resolve all pronouns (it, they, that, this, etc.) to their explicit referents.\n"
-    "- Preserve the original intent and specificity of the question.\n"
-    "- If the question is already self-contained, return it unchanged.\n"
-    "- Output ONLY the rewritten question — no explanation, no preamble.\n"
+    "- Strongly prefer QUERY. Only use CLARIFY when the question cannot be "
+    "answered without more information from the user — clarifications cost "
+    "the user a turn.\n"
+    "- Resolve all pronouns (it, they, that, this, etc.) to their explicit "
+    "referents from the history when possible. Coreference is NOT a reason "
+    "to clarify if the referent is unambiguous from prior turns.\n"
+    "- If the follow-up is already self-contained, output QUERY with it "
+    "unchanged.\n"
+    "- NEVER output anything except the QUERY: or CLARIFY: line. No "
+    "explanation, no preamble, no extra lines.\n"
 )
 
 
@@ -101,25 +114,60 @@ def _format_history_for_rewrite(history: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def rewrite_query(question: str, history: list[dict]) -> str:
-    """Rewrite a follow-up question to be self-contained using conversation history.
+async def rewrite_query(
+    question: str, history: list[dict],
+) -> tuple[str, str]:
+    """Decide whether the follow-up is answerable or needs clarification,
+    and return one of:
 
-    If there's no history, returns the question unchanged.
-    history is a list of {"role": "user"|"assistant", "content": "..."} dicts.
+      ("query",   <self-contained rewritten question>)  → proceed to retrieval
+      ("clarify", <question to ask the user>)            → skip retrieval, stop
+
+    Turn 1 (no history) always returns ("query", question) unchanged —
+    clarification on a brand-new turn is out of scope to avoid adding an
+    LLM call to the cold path.
+
+    If the LLM ignores the QUERY:/CLARIFY: format, the response is treated
+    as ("query", raw_response) so behavior degrades gracefully to the
+    pre-clarification baseline rather than blocking the user.
     """
     if not history:
-        return question
+        return ("query", question)
 
     history_text = _format_history_for_rewrite(history)
 
     prompt = (
         f"Conversation history:\n{history_text}\n\n"
         f"Follow-up question: {question}\n\n"
-        f"Standalone question:"
+        f"Your output:"
     )
 
-    rewritten = await _llm_generate(REWRITE_PROMPT, prompt)
-    return rewritten.strip()
+    raw = (await _llm_generate(REWRITE_PROMPT, prompt)).strip()
+
+    # Strip a leading code fence in case the model wraps its output.
+    if raw.startswith("```"):
+        raw = raw.strip("`").strip()
+
+    upper = raw.upper()
+    if upper.startswith("CLARIFY:"):
+        text = raw[len("CLARIFY:"):].strip()
+        if not text:
+            logger.warning("rewrite_query empty CLARIFY payload — falling back to QUERY")
+            return ("query", question)
+        logger.info("rewrite_query CLARIFY: %s", text[:200])
+        return ("clarify", text)
+
+    if upper.startswith("QUERY:"):
+        text = raw[len("QUERY:"):].strip()
+        if not text:
+            return ("query", question)
+        return ("query", text)
+
+    # Malformed — the model ignored the prefix contract. Fall back to the
+    # pre-clarification behavior: assume the response IS the rewritten
+    # question. Worst case is current production behavior.
+    logger.warning("rewrite_query missing prefix; using raw=%r", raw[:200])
+    return ("query", raw)
 
 
 # ── Context building ───────────────────────────────────────────────

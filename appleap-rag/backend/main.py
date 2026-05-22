@@ -650,6 +650,28 @@ async def _run_generation(
         stream_registry.remove(state.message_id)
 
 
+async def _stream_clarification(
+    conversation_id: str,
+    message_id: str,
+    text: str,
+) -> AsyncIterator[str]:
+    """SSE generator for a clarifying question. The text was produced by the
+    rewrite call and is already complete — we pace delivery at ~Phi-4's
+    native rate (~40 tok/s) so the UX is indistinguishable from a real
+    generation stream."""
+    yield _sse("start", {
+        "conversation_id": conversation_id,
+        "message_id": message_id,
+        "sources": [],
+    })
+    chunk_size = 4  # ~1 token's worth of characters
+    delay = 0.025   # ~40 tok/s
+    for i in range(0, len(text), chunk_size):
+        yield _sse("delta", {"text": text[i:i + chunk_size]})
+        await asyncio.sleep(delay)
+    yield _sse("done", {})
+
+
 async def _stream_existing(state: stream_registry.StreamState) -> AsyncIterator[str]:
     """SSE generator that resumes an in-flight stream. Sends a snapshot of
     accumulated text first, then drains new deltas until done/error."""
@@ -778,8 +800,50 @@ async def query(
                 conv.id, len(inline_attachments), total_inline_bytes,
             )
 
-    # 3. Rewrite query using history (resolves pronouns, references)
-    search_query = await rewrite_query(req.question, history)
+    # 3. Decide: answer the follow-up, or ask a clarifying question?
+    #    The rewrite LLM call is already on the hot path for turns 2+;
+    #    we piggyback the clarity decision on it. Turn 1 always proceeds.
+    mode, payload = await rewrite_query(req.question, history)
+
+    if mode == "clarify":
+        # No retrieval, no background generation. Persist the user message
+        # and an assistant message containing the clarification, then
+        # fake-stream the clarification text back so the UX matches a
+        # normal answer.
+        clarification = payload
+        assistant_msg_id = str(uuid.uuid4())
+        user_msg = Message(
+            conversation_id=conv.id,
+            role="user",
+            content=req.question,
+        )
+        assistant_msg = Message(
+            id=assistant_msg_id,
+            conversation_id=conv.id,
+            role="assistant",
+            content=clarification,
+            status="completed",
+            model_used=settings.llm_model,
+            sources=[],
+            metadata_={"clarification": True},
+        )
+        session.add(user_msg)
+        session.add(assistant_msg)
+        if conv.title == "New Chat":
+            conv.title = req.question[:100]
+        conv.updated_at = datetime.now(timezone.utc)
+        await session.commit()
+
+        return StreamingResponse(
+            _stream_clarification(conv.id, assistant_msg_id, clarification),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    search_query = payload
 
     # 4. Retrieve relevant chunks
     results = await search(
