@@ -18,11 +18,7 @@ async def embed_text(text: str) -> list[float]:
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{settings.ollama_base_url}/api/embed",
-            json={
-                "model": settings.embedding_model,
-                "input": _sanitize(text),
-                "options": {"num_ctx": 8192},
-            },
+            json={"model": settings.embedding_model, "input": _sanitize(text)},
             timeout=60.0,
         )
         response.raise_for_status()
@@ -44,11 +40,7 @@ async def embed_batch(texts: list[str], batch_size: int = 64) -> list[list[float
             batch = [_sanitize(t) for t in texts[i:i + batch_size]]
             response = await client.post(
                 f"{settings.ollama_base_url}/api/embed",
-                json={
-                "model": settings.embedding_model,
-                "input": batch,
-                "options": {"num_ctx": 8192},
-            },
+                json={"model": settings.embedding_model, "input": batch},
                 timeout=120.0,
             )
             if response.status_code >= 400:
