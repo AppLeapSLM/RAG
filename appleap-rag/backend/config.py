@@ -15,12 +15,7 @@ class Settings(BaseSettings):
     parsing_strategy: str = "auto"  # "auto", "fast", "hi_res", "ocr_only"
 
     # Chunking (recursive character splitter)
-    # 2400 picked from a probe against Ollama's nomic-embed-text: the model
-    # has a hardcoded 2048-token cap that Ollama silently rejects on, and
-    # whitespace-heavy text (e.g., pdftotext -layout output) tokenizes at
-    # ~1.2 chars/token. 2400 chars sits comfortably below the threshold for
-    # every offset we sampled in a 17MB doc; >=2800 chars consistently fails.
-    chunk_size: int = 2400          # hard max characters per chunk
+    chunk_size: int = 3000          # hard max characters per chunk
     chunk_overlap: int = 200        # characters of overlap between consecutive chunks
 
     # File upload (corpus — admin-only, CLI/connectors)
