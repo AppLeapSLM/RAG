@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,50 @@ from backend.config import settings
 from backend.parsing.base import ElementType, ParsedDocument, ParsedElement
 
 logger = logging.getLogger(__name__)
+
+
+def _pdftotext_fallback(path: Path) -> ParsedDocument | None:
+    """When Unstructured can't extract any usable text from a PDF (image-heavy
+    slide decks, scanned-but-not-OCR'd pages, anything Unstructured's heuristics
+    bail on), try Poppler's `pdftotext` as a last resort.
+
+    Returns a ParsedDocument with the extracted text as a single NarrativeText
+    element, or None if pdftotext is missing, times out, exits non-zero, or
+    produces no text. Callers fall through to raising the original "no content"
+    error in the None case.
+    """
+    if path.suffix.lower() != ".pdf":
+        return None
+    try:
+        result = subprocess.run(
+            ["pdftotext", "-layout", "-q", str(path), "-"],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        logger.warning("pdftotext fallback unavailable/slow on %s: %s", path.name, exc)
+        return None
+    if result.returncode != 0:
+        logger.warning(
+            "pdftotext exit=%d on %s: %s",
+            result.returncode, path.name, (result.stderr or "")[:200],
+        )
+        return None
+    text = result.stdout.strip()
+    if not text:
+        return None
+    logger.info("pdftotext fallback extracted %d chars from %s", len(text), path.name)
+    return ParsedDocument(
+        filename=path.name,
+        filetype="application/pdf",
+        elements=[
+            ParsedElement(
+                text=text,
+                element_type=ElementType.NARRATIVE_TEXT,
+                metadata={},
+            ),
+        ],
+        metadata={},
+    )
 
 
 def _html_table_to_markdown(html: str) -> str:
@@ -82,11 +127,8 @@ def parse_file(
         strategy=settings.parsing_strategy,
     )
 
-    if not elements:
-        raise ValueError(f"No content extracted from: {path}")
-
     parsed_elements: list[ParsedElement] = []
-    for el in elements:
+    for el in elements or []:
         el_type = _TYPE_MAP.get(type(el).__name__, ElementType.UNCATEGORIZED)
 
         el_meta: dict[str, Any] = {}
@@ -120,6 +162,17 @@ def parse_file(
         parsed_elements.append(
             ParsedElement(text=text, element_type=el_type, metadata=el_meta)
         )
+
+    # Unstructured produced nothing usable. For PDFs, try Poppler's pdftotext —
+    # rescues slide decks and other graphics-heavy PDFs where Unstructured's
+    # heuristics bail or its element list comes back empty. Only raise the
+    # original error if even the fallback finds no text.
+    if not parsed_elements:
+        fallback = _pdftotext_fallback(path)
+        if fallback is not None:
+            fallback.metadata.update(extra_metadata or {})
+            return fallback
+        raise ValueError(f"No content extracted from: {path}")
 
     filetype = ""
     if elements and hasattr(elements[0], "metadata"):

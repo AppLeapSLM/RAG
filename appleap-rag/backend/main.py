@@ -516,9 +516,16 @@ async def ingest_file(
 
         # 3. Parse + chunk via dispatch (routes prose → Unstructured, structured → tree-sitter)
         meta_in = {**extra_metadata, "title": file.filename, "source": source}
-        chunks, doc_meta = await process_file(
-            tmp_path, meta_in, display_name=file.filename
-        )
+        try:
+            chunks, doc_meta = await process_file(
+                tmp_path, meta_in, display_name=file.filename
+            )
+        except ValueError as exc:
+            logger.info("ingest_file no-content file=%s err=%s", file.filename, exc)
+            raise HTTPException(
+                status_code=400,
+                detail="Could not extract any text from this file. If it's an image-only PDF or scan, try converting to text/markdown first.",
+            ) from exc
         if not chunks:
             raise HTTPException(
                 status_code=400, detail="No content extracted from file"
@@ -1182,11 +1189,21 @@ async def upload_attachment(
         os.write(tmp_fd, content)
         os.close(tmp_fd)
 
-        chunks, doc_meta = await process_file(
-            tmp_path,
-            {"title": file.filename, "source": "chat_upload"},
-            display_name=file.filename,
-        )
+        try:
+            chunks, doc_meta = await process_file(
+                tmp_path,
+                {"title": file.filename, "source": "chat_upload"},
+                display_name=file.filename,
+            )
+        except ValueError as exc:
+            # parse_file raises ValueError when neither Unstructured nor the
+            # pdftotext fallback can extract text (typically image-only PDFs).
+            logger.info("chat_upload no-content conv=%s file=%s err=%s",
+                        conversation_id, file.filename, exc)
+            raise HTTPException(
+                status_code=400,
+                detail="Could not extract any text from this file. If it's an image-only PDF or scan, try converting to text/markdown first.",
+            ) from exc
         if not chunks:
             raise HTTPException(
                 status_code=400,
