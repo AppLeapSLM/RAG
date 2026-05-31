@@ -793,14 +793,20 @@ async function ensureConversation() {
 }
 
 async function attachFile(file) {
-  // Render a pending chip immediately for feedback
+  // Render a pending chip with a Cancel (×) — abort the in-flight upload.
+  // Once the upload commits, the × goes away (attachments are immutable
+  // for the chat's lifetime; only deleting the chat removes them).
   const chip = document.createElement("div");
   chip.className = "chip uploading";
   chip.innerHTML = `
     <span class="chip-name" title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</span>
     <span class="chip-mode">uploading…</span>
+    <button class="chip-close" title="Cancel upload">&times;</button>
   `;
   chipsEl.appendChild(chip);
+
+  const ac = new AbortController();
+  chip.querySelector(".chip-close").addEventListener("click", () => ac.abort());
 
   // Block the send button while a chunked upload is in flight
   attachBtn.disabled = true;
@@ -813,6 +819,7 @@ async function attachFile(file) {
     const r = await apiFetch(`${API}/conversations/${convId}/attachments`, {
       method: "POST",
       body: fd,
+      signal: ac.signal,
     });
     if (!r.ok) {
       const err = await r.json().catch(() => ({ detail: r.statusText }));
@@ -828,6 +835,11 @@ async function attachFile(file) {
     const data = await r.json();
     renderChip(chip, data);
   } catch (e) {
+    // User-initiated abort: silently remove the chip, no error UI.
+    if (e.name === "AbortError") {
+      chip.remove();
+      return;
+    }
     chip.className = "chip error";
     chip.innerHTML = `
       <span class="chip-name">${escapeHtml(file.name)}</span>
@@ -842,24 +854,14 @@ async function attachFile(file) {
 }
 
 function renderChip(chip, attachment) {
+  // Committed attachment chip — no close button. Only way to remove is to
+  // delete the chat (cascades via DB foreign keys).
   chip.className = "chip";
   chip.dataset.attachmentId = attachment.attachment_id;
   chip.innerHTML = `
     <span class="chip-name" title="${escapeHtml(attachment.filename)}">${escapeHtml(attachment.filename)}</span>
     <span class="chip-mode">${escapeHtml(attachment.mode)}</span>
-    <button class="chip-close" title="Remove">&times;</button>
   `;
-  chip.querySelector(".chip-close").addEventListener("click", async () => {
-    if (!currentConversationId) return;
-    const id = chip.dataset.attachmentId;
-    try {
-      await apiFetch(
-        `${API}/conversations/${currentConversationId}/attachments/${id}`,
-        { method: "DELETE" },
-      );
-    } catch {}
-    chip.remove();
-  });
 }
 
 async function loadAttachments(convId) {

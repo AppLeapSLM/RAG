@@ -72,7 +72,19 @@ async def search(
         conversation_id=conversation_id,
         user_email=user_email, user_groups=user_groups,
     )
-    vector_results, keyword_results = await asyncio.gather(vector_task, keyword_task)
+    # Force-include every chunk from this conversation's attachments. Vector
+    # and keyword retrievers can miss attachment chunks (corpus often
+    # out-ranks them on generic queries — see CMDB-03 / "Based on
+    # DeviceItemID" regression). Sending all attachment chunks straight to
+    # the reranker is bounded by the 5MB chat-upload cap and lets the
+    # reranker make the final call.
+    attachment_task = _all_attachment_chunks(
+        session, conversation_id=conversation_id,
+        user_email=user_email, user_groups=user_groups,
+    )
+    vector_results, keyword_results, attachment_results = await asyncio.gather(
+        vector_task, keyword_task, attachment_task,
+    )
 
     # Union + dedupe by chunk_id. First occurrence wins; order doesn't matter
     # because the reranker re-scores everything.
@@ -81,11 +93,13 @@ async def search(
         pool.setdefault(c.id, c)
     for c in keyword_results:
         pool.setdefault(c.id, c)
+    for c in attachment_results:
+        pool.setdefault(c.id, c)
     candidates = list(pool.values())
 
     logger.info(
-        "Hybrid pool: %d vector + %d keyword = %d unique candidates",
-        len(vector_results), len(keyword_results), len(candidates),
+        "Hybrid pool: %d vector + %d keyword + %d attachment = %d unique candidates",
+        len(vector_results), len(keyword_results), len(attachment_results), len(candidates),
     )
 
     reranked = await rerank(query, candidates, top_k=top_k)
@@ -139,6 +153,32 @@ async def _vector_search(
         stmt.order_by(Chunk.embedding.cosine_distance(query_embedding))
         .limit(top_k)
     )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def _all_attachment_chunks(
+    session: AsyncSession,
+    conversation_id: str | None = None,
+    user_email: str | None = None,
+    user_groups: list[str] | None = None,
+) -> list[Chunk]:
+    """Every chunk from this conversation's chunked attachments. Empty when
+    no conversation_id is set (eval / corpus-only path) or no attachments
+    exist. Applies the same ACL filter as the other retrievers.
+    """
+    if not conversation_id:
+        return []
+    stmt = (
+        select(Chunk)
+        .join(Document, Chunk.document_id == Document.id)
+        .where(Document.source_type == "attachment")
+        .where(Document.conversation_id == conversation_id)
+    )
+    if user_email:
+        stmt = stmt.where(
+            acl_filter_textclause(user_email, user_groups or [], chunk_table="chunks")
+        )
     result = await session.execute(stmt)
     return list(result.scalars().all())
 
