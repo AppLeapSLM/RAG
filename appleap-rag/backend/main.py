@@ -262,11 +262,11 @@ class UserResponse(BaseModel):
 
 ALLOWED_EXTENSIONS = {
     # Prose / office (via Unstructured.io)
-    ".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls",
+    ".pdf", ".docx", ".doc", ".pptx", ".ppt",
     ".md", ".markdown", ".txt", ".html", ".htm", ".rst", ".xml",
     ".eml", ".rtf",
-    # Tabular
-    ".csv",
+    # Tabular — row-per-chunk pipe format (.xlsx/.xls via Excel path, .csv/.tsv via CSV path)
+    ".csv", ".tsv", ".xlsx", ".xls",
     # IaC / config (via tree-sitter)
     ".tf", ".tfvars", ".hcl", ".yaml", ".yml", ".json", ".pp",
     ".conf",  # misc text config files — fall through to prose path

@@ -31,7 +31,8 @@ class Format(str, Enum):
     TYPESCRIPT = "typescript"  # tree-sitter typescript
     BASH = "bash"              # tree-sitter bash
     DOCKERFILE = "dockerfile"  # tree-sitter dockerfile
-    CSV = "csv"                # csv -> json -> tree-sitter json
+    CSV = "csv"                # csv/tsv -> one chunk per row, pipe-formatted
+    EXCEL = "excel"            # xlsx/xls -> one chunk per row, pipe-formatted
 
 
 class DocType(str, Enum):
@@ -83,8 +84,15 @@ _EXT_TO_FORMAT: dict[str, Format] = {
     ".tsx": Format.TYPESCRIPT,
     ".sh": Format.BASH,
     ".bash": Format.BASH,
-    # Tabular
+    # Tabular — row-per-chunk pipe format (no tree-sitter, no Unstructured)
     ".csv": Format.CSV,
+    ".tsv": Format.CSV,   # tab-separated; CSV path sniffs the delimiter
+    # Spreadsheets — read via openpyxl (.xlsx) / xlrd (.xls), then row-per-chunk
+    # pipe format. NOTE: moved off the PROSE/Unstructured default so a sheet is
+    # treated as structured tabular data, not blobbed into a headerless Markdown
+    # table. See dispatch._process_spreadsheet.
+    ".xlsx": Format.EXCEL,
+    ".xls": Format.EXCEL,
     # Prose
     ".md": Format.PROSE,
     ".markdown": Format.PROSE,
