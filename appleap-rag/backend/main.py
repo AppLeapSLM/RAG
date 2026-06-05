@@ -116,6 +116,33 @@ async def lifespan(app: FastAPI):
             ON chunks USING gin(metadata jsonb_path_ops)
         """))
 
+        # chunks.document_id historically had NO foreign key, so deleting a
+        # document (e.g. via chat-delete cascading to its attachment document)
+        # left the document's chunks orphaned in place forever. Add the FK with
+        # ON DELETE CASCADE so chunks are cleaned up with their parent. Existing
+        # orphans must be deleted first or ADD CONSTRAINT fails validation.
+        # Guard on the presence of ANY chunks→documents FK so this is a no-op on
+        # fresh installs (where create_all already makes it from the model) and
+        # runs exactly once on existing databases.
+        await conn.execute(__import__("sqlalchemy").text("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE contype = 'f'
+                      AND conrelid = 'chunks'::regclass
+                      AND confrelid = 'documents'::regclass
+                ) THEN
+                    DELETE FROM chunks c
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM documents d WHERE d.id = c.document_id
+                    );
+                    ALTER TABLE chunks ADD CONSTRAINT fk_chunks_document_id
+                        FOREIGN KEY (document_id) REFERENCES documents(id)
+                        ON DELETE CASCADE;
+                END IF;
+            END $$
+        """))
+
         # Auth rollout: one-shot legacy wipe.
         # Detected by: conversations table exists but owner_user_id column does NOT.
         # This runs once on the first deploy carrying auth, then never again.
