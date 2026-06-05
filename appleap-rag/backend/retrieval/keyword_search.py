@@ -45,6 +45,7 @@ async def keyword_search(
     conversation_id: str | None = None,
     user_email: str | None = None,
     user_groups: list[str] | None = None,
+    scope: str | None = None,
 ) -> list[Chunk]:
     """BM25-style keyword search using PostgreSQL full-text search with OR semantics.
 
@@ -59,9 +60,12 @@ async def keyword_search(
     hits. The log-scale penalty evens this out without brutally crushing
     medium-sized chunks.
 
-    Scope (via JOIN documents):
-    - conversation_id=None → corpus only
-    - conversation_id set  → corpus + attachments for that conversation
+    Scope (via JOIN documents) — the ONLY scope-dependent line; ranking/ACL/
+    limit are identical across scopes. `scope` selects:
+      - "corpus"      → corpus documents only
+      - "attachment"  → chunked attachments for `conversation_id` only
+      - "both"        → corpus + this conversation's attachments
+      - None (legacy) → "both" if conversation_id is set, else "corpus"
 
     ACL: when `user_email` is set, filters by chunks.metadata->'acl' against
     user + groups. Bypassed when None (eval/pre-auth path).
@@ -70,13 +74,18 @@ async def keyword_search(
     if not tsquery:
         return []
 
-    if conversation_id:
+    effective_scope = scope or ("both" if conversation_id else "corpus")
+    if effective_scope == "corpus":
+        scope_clause = "AND d.source_type = 'corpus'"
+    elif effective_scope == "attachment":
+        scope_clause = (
+            "AND d.source_type = 'attachment' AND d.conversation_id = :conv_id"
+        )
+    else:  # "both"
         scope_clause = (
             "AND (d.source_type = 'corpus' "
             "OR (d.source_type = 'attachment' AND d.conversation_id = :conv_id))"
         )
-    else:
-        scope_clause = "AND d.source_type = 'corpus'"
 
     params: dict = {"tsquery": tsquery, "top_k": top_k}
     if conversation_id:

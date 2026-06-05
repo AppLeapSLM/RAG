@@ -24,6 +24,14 @@ logger = logging.getLogger(__name__)
 VECTOR_OVERFETCH = 25
 KEYWORD_OVERFETCH = 75
 
+# Attachment lane over-fetch. Attachment chunks are retrieved in their own
+# scoped pass (same hybrid search, scoped to this conversation's attachments)
+# so the corpus can't drown them. Bounded so a many-row tabular attachment
+# (one chunk per row → hundreds/thousands of chunks) can't flood the reranker.
+# When an attachment has fewer chunks than this, the scoped search returns all
+# of them — identical to the old force-include for small attachments.
+ATTACHMENT_OVERFETCH = 50
+
 
 async def search(
     query: str,
@@ -46,9 +54,18 @@ async def search(
     No RRF: a cross-encoder overrides whatever order RRF produces, so RRF
     becomes dead weight. See CLAUDE.md V8 Phase 2.
 
-    Scope:
-    - When `conversation_id` is None: corpus only.
-    - When set: corpus + chunked attachments tagged to that conversation.
+    Lanes (all feed the same dedup → reranker):
+    - Corpus lane: the hybrid search scoped to corpus documents only.
+    - Attachment lane: the SAME hybrid search (same `_vector_search` +
+      `keyword_search`, same ranking/ACL), scoped to this conversation's
+      attachment chunks only, with a bounded over-fetch. Runs only when a
+      `conversation_id` is set. This replaces the old unbounded
+      `_all_attachment_chunks` force-include: attachment chunks are ranked
+      among themselves (so the large corpus can't drown them — the
+      "interfaces.json missed for DeviceItemID" regression) AND capped at
+      ATTACHMENT_OVERFETCH (so a many-row tabular attachment can't flood the
+      reranker). Small attachments (chunks ≤ cap) are returned in full, same
+      as before.
 
     ACL:
     - When `user_email` is set, both retrievers filter by chunks.metadata->'acl'
@@ -62,44 +79,55 @@ async def search(
     if user_email:
         user_groups = await resolve_user_groups(session, user_email)
 
-    vector_task = _vector_search(
-        query, session, top_k=VECTOR_OVERFETCH,
-        conversation_id=conversation_id,
-        user_email=user_email, user_groups=user_groups,
-    )
-    keyword_task = keyword_search(
-        query, session, top_k=KEYWORD_OVERFETCH,
-        conversation_id=conversation_id,
-        user_email=user_email, user_groups=user_groups,
-    )
-    # Force-include every chunk from this conversation's attachments. Vector
-    # and keyword retrievers can miss attachment chunks (corpus often
-    # out-ranks them on generic queries — see CMDB-03 / "Based on
-    # DeviceItemID" regression). Sending all attachment chunks straight to
-    # the reranker is bounded by the 5MB chat-upload cap and lets the
-    # reranker make the final call.
-    attachment_task = _all_attachment_chunks(
-        session, conversation_id=conversation_id,
-        user_email=user_email, user_groups=user_groups,
-    )
-    vector_results, keyword_results, attachment_results = await asyncio.gather(
-        vector_task, keyword_task, attachment_task,
-    )
+    # Corpus lane — existing hybrid search, scoped to corpus only.
+    corpus_tasks = [
+        _vector_search(
+            query, session, top_k=VECTOR_OVERFETCH, scope="corpus",
+            user_email=user_email, user_groups=user_groups,
+        ),
+        keyword_search(
+            query, session, top_k=KEYWORD_OVERFETCH, scope="corpus",
+            user_email=user_email, user_groups=user_groups,
+        ),
+    ]
+    # Attachment lane — the same hybrid search, scoped to this conversation's
+    # attachment chunks, bounded by ATTACHMENT_OVERFETCH.
+    attachment_tasks = []
+    if conversation_id:
+        attachment_tasks = [
+            _vector_search(
+                query, session, top_k=ATTACHMENT_OVERFETCH, scope="attachment",
+                conversation_id=conversation_id,
+                user_email=user_email, user_groups=user_groups,
+            ),
+            keyword_search(
+                query, session, top_k=ATTACHMENT_OVERFETCH, scope="attachment",
+                conversation_id=conversation_id,
+                user_email=user_email, user_groups=user_groups,
+            ),
+        ]
+
+    all_results = await asyncio.gather(*corpus_tasks, *attachment_tasks)
+    corpus_vec, corpus_kw = all_results[0], all_results[1]
+    att_vec = all_results[2] if attachment_tasks else []
+    att_kw = all_results[3] if attachment_tasks else []
 
     # Union + dedupe by chunk_id. First occurrence wins; order doesn't matter
     # because the reranker re-scores everything.
     pool: dict[str, Chunk] = {}
-    for c in vector_results:
+    for c in corpus_vec:
         pool.setdefault(c.id, c)
-    for c in keyword_results:
+    for c in corpus_kw:
         pool.setdefault(c.id, c)
-    for c in attachment_results:
+    for c in att_vec:
+        pool.setdefault(c.id, c)
+    for c in att_kw:
         pool.setdefault(c.id, c)
     candidates = list(pool.values())
 
     logger.info(
-        "Hybrid pool: %d vector + %d keyword + %d attachment = %d unique candidates",
-        len(vector_results), len(keyword_results), len(attachment_results), len(candidates),
+        "Hybrid pool: corpus(%d vec + %d kw) + attachment(%d vec + %d kw) = %d unique candidates",
+        len(corpus_vec), len(corpus_kw), len(att_vec), len(att_kw), len(candidates),
     )
 
     reranked = await rerank(query, candidates, top_k=top_k)
@@ -117,17 +145,31 @@ async def _vector_search(
     conversation_id: str | None = None,
     user_email: str | None = None,
     user_groups: list[str] | None = None,
+    scope: str | None = None,
 ) -> list[Chunk]:
     """Pure vector similarity search via pgvector cosine distance.
 
-    Scopes results to corpus docs plus (optionally) chunked attachments
-    tagged to `conversation_id`. Never returns other conversations' attachments.
+    `scope` selects which documents are searchable (the ONLY scope-dependent
+    line; ranking/ACL/limit are identical across scopes):
+      - "corpus"      → corpus documents only
+      - "attachment"  → chunked attachments for `conversation_id` only
+      - "both"        → corpus + this conversation's attachments
+      - None (legacy) → "both" if conversation_id is set, else "corpus"
+    Never returns other conversations' attachments.
 
     Applies ACL filter when `user_email` is set; bypassed otherwise.
     """
     query_embedding = await embed_text(query)
 
-    if conversation_id:
+    effective_scope = scope or ("both" if conversation_id else "corpus")
+    if effective_scope == "corpus":
+        scope_filter = Document.source_type == "corpus"
+    elif effective_scope == "attachment":
+        scope_filter = and_(
+            Document.source_type == "attachment",
+            Document.conversation_id == conversation_id,
+        )
+    else:  # "both"
         scope_filter = or_(
             Document.source_type == "corpus",
             and_(
@@ -135,8 +177,6 @@ async def _vector_search(
                 Document.conversation_id == conversation_id,
             ),
         )
-    else:
-        scope_filter = Document.source_type == "corpus"
 
     stmt = (
         select(Chunk)
@@ -153,32 +193,6 @@ async def _vector_search(
         stmt.order_by(Chunk.embedding.cosine_distance(query_embedding))
         .limit(top_k)
     )
-    result = await session.execute(stmt)
-    return list(result.scalars().all())
-
-
-async def _all_attachment_chunks(
-    session: AsyncSession,
-    conversation_id: str | None = None,
-    user_email: str | None = None,
-    user_groups: list[str] | None = None,
-) -> list[Chunk]:
-    """Every chunk from this conversation's chunked attachments. Empty when
-    no conversation_id is set (eval / corpus-only path) or no attachments
-    exist. Applies the same ACL filter as the other retrievers.
-    """
-    if not conversation_id:
-        return []
-    stmt = (
-        select(Chunk)
-        .join(Document, Chunk.document_id == Document.id)
-        .where(Document.source_type == "attachment")
-        .where(Document.conversation_id == conversation_id)
-    )
-    if user_email:
-        stmt = stmt.where(
-            acl_filter_textclause(user_email, user_groups or [], chunk_table="chunks")
-        )
     result = await session.execute(stmt)
     return list(result.scalars().all())
 
