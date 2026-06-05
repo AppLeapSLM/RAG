@@ -18,6 +18,8 @@ import asyncio
 import csv
 import io
 import logging
+import math
+import re
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -158,7 +160,9 @@ def _process_csv(
 
     rows = _csv_to_row_objects(raw, delimiter=delimiter)
     if not rows:
-        return [], _csv_doc_meta(display_name, meta, num_elements=0)
+        return [], _csv_doc_meta(
+            display_name, meta, num_elements=0, table_schema={"tables": []}
+        )
 
     chunks: list[dict[str, Any]] = []
     bracket = _bracket_header(display_name, meta)
@@ -172,11 +176,19 @@ def _process_csv(
                 **meta,
                 "csv_row_index": i,
                 "total_rows": len(rows),
+                # Structured copy of the row — same data as pipe_content but
+                # unambiguous — so the tabular-SQL path can rebuild an exact
+                # table without reverse-parsing the pipe string (cell values
+                # may legitimately contain '|' or ':'). See _table_schema_entry.
+                "row_data": dict(row),
             },
             "element_types": ["csv_row"],
         })
 
-    return chunks, _csv_doc_meta(display_name, meta, num_elements=len(chunks))
+    table_schema = {"tables": [_table_schema_entry(rows, sheet_name=None)]}
+    return chunks, _csv_doc_meta(
+        display_name, meta, num_elements=len(chunks), table_schema=table_schema
+    )
 
 
 def _csv_to_row_objects(raw: str, delimiter: str = ",") -> list[dict[str, str]]:
@@ -246,6 +258,7 @@ def _csv_doc_meta(
     display_name: str,
     meta: dict[str, Any],
     num_elements: int,
+    table_schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "filetype": "text/csv",
@@ -253,6 +266,7 @@ def _csv_doc_meta(
         "num_elements": num_elements,
         "format": Format.CSV.value,
         "doc_type": meta.get("doc_type", DocType.GENERIC.value),
+        "table_schema": table_schema or {"tables": []},
     }
 
 
@@ -297,10 +311,15 @@ def _process_spreadsheet(
     multi_sheet = len(sheets) > 1
 
     chunks: list[dict[str, Any]] = []
+    table_entries: list[dict[str, Any]] = []
     for sheet_name, raw_rows in sheets:
         rows = _sheet_rows_to_objects(raw_rows)
         if not rows:
             continue
+        # One schema entry per sheet — a multi-sheet workbook is multiple tables
+        # with independent columns; the tabular-SQL path builds one DuckDB table
+        # per sheet (chunks carry sheet_name to scope reconstruction).
+        table_entries.append(_table_schema_entry(rows, sheet_name=sheet_name))
         bracket = _bracket_header(
             display_name, meta, sheet_name=sheet_name if multi_sheet else None
         )
@@ -315,11 +334,15 @@ def _process_spreadsheet(
                     "sheet_name": sheet_name,
                     "csv_row_index": i,
                     "total_rows": len(rows),
+                    "row_data": dict(row),
                 },
                 "element_types": ["spreadsheet_row"],
             })
 
-    return chunks, _excel_doc_meta(display_name, meta, suffix, num_elements=len(chunks))
+    table_schema = {"tables": table_entries}
+    return chunks, _excel_doc_meta(
+        display_name, meta, suffix, num_elements=len(chunks), table_schema=table_schema
+    )
 
 
 def _read_workbook(path: Path, suffix: str) -> list[tuple[str, list[list[Any]]]]:
@@ -436,6 +459,7 @@ def _excel_doc_meta(
     meta: dict[str, Any],
     suffix: str,
     num_elements: int,
+    table_schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     mime = (
         "application/vnd.ms-excel"
@@ -448,7 +472,90 @@ def _excel_doc_meta(
         "num_elements": num_elements,
         "format": Format.EXCEL.value,
         "doc_type": meta.get("doc_type", DocType.GENERIC.value),
+        "table_schema": table_schema or {"tables": []},
     }
+
+
+# ── Tabular schema inference (shared CSV/Excel) ──────────────────────
+
+_INT_RE = re.compile(r"^[+-]?\d+$")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+
+
+def _table_schema_entry(
+    rows: list[dict[str, str]],
+    sheet_name: str | None = None,
+) -> dict[str, Any]:
+    """Derive a column schema for one table (a CSV/TSV, or one Excel sheet).
+
+    Columns are the union of keys across all rows, in first-appearance order —
+    rows can differ because empty cells are dropped per row (see
+    _csv_to_row_objects / _sheet_rows_to_objects), and real sheets drift their
+    columns across rows. Each column's type is inferred from the values that
+    actually appear in it. Stored on the document so the tabular-SQL path can
+    build a correctly typed DuckDB table without re-reading the original file
+    (the original bytes are not retained after ingest).
+    """
+    col_order: list[str] = []
+    col_values: dict[str, list[str]] = {}
+    for row in rows:
+        for key, val in row.items():
+            if key not in col_values:
+                col_values[key] = []
+                col_order.append(key)
+            col_values[key].append(val)
+    columns = [
+        {"name": c, "type": _infer_column_type(col_values[c])} for c in col_order
+    ]
+    return {
+        "sheet_name": sheet_name,
+        "columns": columns,
+        "row_count": len(rows),
+    }
+
+
+def _infer_column_type(values: list[str]) -> str:
+    """Best-effort SQL-ish type for a column from its string values.
+
+    Conservative: a column is only narrowed to a numeric/temporal type when
+    EVERY non-empty value matches. Anything mixed or ambiguous (incl. thousands
+    separators like "1,234", or inf/nan) stays 'text' — the SQL builder can
+    still TRY_CAST at query time. Returns: integer | double | date |
+    timestamp | text.
+    """
+    vals = [v for v in values if v]
+    if not vals:
+        return "text"
+    if all(_INT_RE.match(v) for v in vals):
+        return "integer"
+    if all(_is_finite_float(v) for v in vals):
+        return "double"
+    if all(_DATE_RE.match(v) and _is_valid_date(v, "%Y-%m-%d") for v in vals):
+        return "date"
+    if all(
+        _TIMESTAMP_RE.match(v) and _is_valid_date(v, "%Y-%m-%d %H:%M:%S")
+        for v in vals
+    ):
+        return "timestamp"
+    return "text"
+
+
+def _is_finite_float(value: str) -> bool:
+    """True only for a real finite number — rejects 'inf'/'nan'/'infinity'
+    (which float() accepts) so text columns aren't misread as numeric."""
+    try:
+        return math.isfinite(float(value))
+    except ValueError:
+        return False
+
+
+def _is_valid_date(value: str, fmt: str) -> bool:
+    try:
+        datetime.strptime(value, fmt)
+        return True
+    except ValueError:
+        return False
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
