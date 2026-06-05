@@ -32,27 +32,32 @@ SYSTEM_PROMPT = (
 
 REWRITE_PROMPT = (
     "You are a query interpreter for an IT operations RAG system. Given a "
-    "conversation history and the user's latest follow-up, you must decide "
-    "whether the follow-up can be answered as-is (after pronoun resolution) "
-    "or whether it is too vague / ambiguous to answer confidently. Output "
-    "EXACTLY ONE line, starting with one of the two prefixes:\n\n"
+    "conversation history and the user's latest follow-up, classify it and "
+    "output EXACTLY ONE line, starting with one of THREE prefixes:\n\n"
     "QUERY: <a fully self-contained standalone question, with pronouns "
     "resolved and needed context folded in from the history>\n"
     "CLARIFY: <one short, focused question to ask the user — at most one "
     "sentence — when the follow-up is genuinely ambiguous or missing a "
     "required entity (e.g., which service, which environment, which time "
-    "range)>\n\n"
+    "range)>\n"
+    "AGGREGATE: <the self-contained standalone question> — use this ONLY when "
+    "answering requires a CALCULATION over MANY or ALL rows of tabular data: "
+    "a sum, count, average, min/max, grand total, or \"how many ... across "
+    "all ...\". These must be computed over a whole table, not looked up.\n\n"
     "RULES:\n"
-    "- Strongly prefer QUERY. Only use CLARIFY when the question cannot be "
-    "answered without more information from the user — clarifications cost "
-    "the user a turn.\n"
+    "- Choose AGGREGATE only for compute-over-many-rows questions (totals, "
+    "counts, averages, etc.). A SINGLE-ROW lookup (\"what was the profit on "
+    "Jan 3?\", \"which team owns api-gateway?\") is QUERY, not AGGREGATE.\n"
+    "- Otherwise strongly prefer QUERY. Use CLARIFY only when the question "
+    "cannot be answered without more information from the user — "
+    "clarifications cost the user a turn.\n"
     "- Resolve all pronouns (it, they, that, this, etc.) to their explicit "
     "referents from the history when possible. Coreference is NOT a reason "
-    "to clarify if the referent is unambiguous from prior turns.\n"
-    "- If the follow-up is already self-contained, output QUERY with it "
-    "unchanged.\n"
-    "- NEVER output anything except the QUERY: or CLARIFY: line. No "
-    "explanation, no preamble, no extra lines.\n"
+    "to CLARIFY if the referent is unambiguous from prior turns.\n"
+    "- For QUERY and AGGREGATE, if the follow-up is already self-contained, "
+    "output it unchanged.\n"
+    "- NEVER output anything except the single QUERY:/CLARIFY:/AGGREGATE: "
+    "line. No explanation, no preamble, no extra lines.\n"
 )
 
 
@@ -119,25 +124,24 @@ async def rewrite_query(
     history: list[dict],
     attachment_filenames: list[str] | None = None,
 ) -> tuple[str, str]:
-    """Decide whether the follow-up is answerable or needs clarification,
-    and return one of:
+    """Classify the follow-up and return one of:
 
-      ("query",   <self-contained rewritten question>)  → proceed to retrieval
-      ("clarify", <question to ask the user>)            → skip retrieval, stop
+      ("query",     <self-contained rewritten question>)  → proceed to retrieval
+      ("clarify",   <question to ask the user>)            → skip retrieval, stop
+      ("aggregate", <self-contained rewritten question>)   → tabular-SQL path
 
-    Cold path (no history AND no attachments) returns ("query", question)
-    unchanged — no LLM call, fastest UX. As soon as either history exists
-    or files are attached to the conversation, we pay the rewrite call so
-    the model can resolve references like "this doc" to the actual filename
-    before retrieval runs.
+    Runs on EVERY turn and may rewrite ANY turn — intent classification is now
+    a permanent front-door (the tabular-SQL route and future routing need it on
+    turn 1), and full reference-resolution/rewriting applies to first turns too,
+    not just when an attachment is present. The cost is one short LLM call per
+    turn — negligible against generation.
 
-    If the LLM ignores the QUERY:/CLARIFY: format, the response is treated
-    as ("query", raw_response) so behavior degrades gracefully to the
-    pre-clarification baseline rather than blocking the user.
+    The prompt biases toward leaving an already-self-contained question
+    unchanged, so gratuitous rewording is rare. If the LLM ignores the prefix
+    contract or returns an empty payload, the response degrades to
+    ("query", <original or raw>) so behavior never blocks the user.
     """
     attachment_filenames = attachment_filenames or []
-    if not history and not attachment_filenames:
-        return ("query", question)
 
     history_text = (
         _format_history_for_rewrite(history) if history else "(no prior turns)"
@@ -170,15 +174,19 @@ async def rewrite_query(
         logger.info("rewrite_query CLARIFY: %s", text[:200])
         return ("clarify", text)
 
+    if upper.startswith("AGGREGATE:"):
+        text = raw[len("AGGREGATE:"):].strip()
+        payload = text or question
+        logger.info("rewrite_query AGGREGATE: %s", payload[:200])
+        return ("aggregate", payload)
+
     if upper.startswith("QUERY:"):
         text = raw[len("QUERY:"):].strip()
-        if not text:
-            return ("query", question)
-        return ("query", text)
+        return ("query", text or question)
 
     # Malformed — the model ignored the prefix contract. Fall back to the
-    # pre-clarification behavior: assume the response IS the rewritten
-    # question. Worst case is current production behavior.
+    # pre-clarification behavior: assume the response IS the rewritten question.
+    # Worst case is current production behavior.
     logger.warning("rewrite_query missing prefix; using raw=%r", raw[:200])
     return ("query", raw)
 

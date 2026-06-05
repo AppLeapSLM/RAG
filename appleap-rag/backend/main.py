@@ -897,6 +897,15 @@ async def query(
             },
         )
 
+    if mode == "aggregate":
+        # Phase 3 (detection-only): log the routing decision so we can evaluate
+        # classification quality against the eval set without changing answers.
+        # Phase 4 replaces this branch with the DuckDB tabular-SQL path; for now
+        # it falls through and is answered by normal retrieval like any query.
+        logger.info(
+            "query_route AGGREGATE detected conv=%s q=%r", conv.id, payload[:200]
+        )
+
     search_query = payload
 
     # 4. Retrieve relevant chunks
