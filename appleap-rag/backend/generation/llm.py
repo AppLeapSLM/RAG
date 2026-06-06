@@ -31,33 +31,32 @@ SYSTEM_PROMPT = (
 )
 
 REWRITE_PROMPT = (
-    "You are a query interpreter for an IT operations RAG system. Given a "
-    "conversation history and the user's latest follow-up, classify it and "
-    "output EXACTLY ONE line, starting with one of THREE prefixes:\n\n"
-    "QUERY: <a fully self-contained standalone question, with pronouns "
-    "resolved and needed context folded in from the history>\n"
-    "CLARIFY: <one short, focused question to ask the user — at most one "
-    "sentence — when the follow-up is genuinely ambiguous or missing a "
-    "required entity (e.g., which service, which environment, which time "
-    "range)>\n"
-    "AGGREGATE: <the self-contained standalone question> — use this ONLY when "
-    "answering requires a CALCULATION over MANY or ALL rows of tabular data: "
-    "a sum, count, average, min/max, grand total, or \"how many ... across "
-    "all ...\". These must be computed over a whole table, not looked up.\n\n"
-    "RULES:\n"
-    "- Choose AGGREGATE only for compute-over-many-rows questions (totals, "
-    "counts, averages, etc.). A SINGLE-ROW lookup (\"what was the profit on "
-    "Jan 3?\", \"which team owns api-gateway?\") is QUERY, not AGGREGATE.\n"
-    "- Otherwise strongly prefer QUERY. Use CLARIFY only when the question "
-    "cannot be answered without more information from the user — "
-    "clarifications cost the user a turn.\n"
-    "- Resolve all pronouns (it, they, that, this, etc.) to their explicit "
-    "referents from the history when possible. Coreference is NOT a reason "
-    "to CLARIFY if the referent is unambiguous from prior turns.\n"
-    "- For QUERY and AGGREGATE, if the follow-up is already self-contained, "
-    "output it unchanged.\n"
-    "- NEVER output anything except the single QUERY:/CLARIFY:/AGGREGATE: "
-    "line. No explanation, no preamble, no extra lines.\n"
+    "You route the user's latest message in an IT-operations assistant. Choose "
+    "ONE action and output EXACTLY ONE line starting with its prefix. Each "
+    "action has a real consequence:\n\n"
+    "QUERY: <self-contained, pronoun-resolved question> — the system RETRIEVES "
+    "relevant documents and answers. For normal questions answerable from the "
+    "documents.\n"
+    "AGGREGATE: <self-contained question> — the system runs a SQL computation "
+    "over a structured data table, and it can find the right table and columns "
+    "ITSELF. Use when answering needs a calculation over many or all rows: a "
+    "count, sum, average, min/max, total, or 'how many ...'. (A single-row "
+    "lookup is QUERY, not AGGREGATE.)\n"
+    "CLARIFY: <one short question to the user> — the system STOPS and asks the "
+    "user, spending a turn and returning no answer this turn.\n\n"
+    "HOW TO DECIDE — prefer acting over asking:\n"
+    "- A QUERY or AGGREGATE attempt is CHEAP and RECOVERABLE: if it cannot find "
+    "the answer it simply says so. So if EITHER could plausibly resolve the "
+    "message, choose it.\n"
+    "- The system resolves details by inspecting its OWN data (e.g. which "
+    "table, sheet, or column a value lives in). Do NOT ask the user about "
+    "anything the system could discover for itself.\n"
+    "- Use CLARIFY ONLY as a last resort: when no attempt could succeed without "
+    "information that ONLY the user can provide (e.g. a referent with nothing in "
+    "the history or attachments to resolve it).\n"
+    "- Resolve pronouns (it/they/that/this/these) from the history; if the "
+    "message is already self-contained, keep it unchanged.\n"
+    "- Output ONLY the single QUERY:/AGGREGATE:/CLARIFY: line.\n"
 )
 
 
@@ -136,6 +135,7 @@ async def rewrite_query(
     question: str,
     history: list[dict],
     attachment_filenames: list[str] | None = None,
+    prev_was_clarification: bool = False,
 ) -> tuple[str, str]:
     """Classify the follow-up and return one of:
 
@@ -180,6 +180,12 @@ async def rewrite_query(
 
     upper = raw.upper()
     if upper.startswith("CLARIFY:"):
+        # Loop-breaker: if we ALREADY clarified last turn and the user replied,
+        # never clarify again — make a best-effort attempt instead. Guarantees
+        # the user can always escape a clarification by responding.
+        if prev_was_clarification:
+            logger.info("rewrite_query CLARIFY suppressed (prev turn was a clarification) — attempting query")
+            return ("query", question)
         text = raw[len("CLARIFY:"):].strip()
         if not text:
             logger.warning("rewrite_query empty CLARIFY payload — falling back to QUERY")

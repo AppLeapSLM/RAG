@@ -835,6 +835,12 @@ async def query(
         )
     ).scalars().all()
     history = [{"role": m.role, "content": m.content} for m in rows]
+    # Loop-breaker for the rewriter: if our last reply was a clarification, the
+    # user is answering it — don't clarify again, attempt the query instead.
+    _last_assistant = next((m for m in reversed(rows) if m.role == "assistant"), None)
+    prev_was_clarification = bool(
+        _last_assistant and (_last_assistant.metadata_ or {}).get("clarification")
+    )
 
     # 2b. Load inline attachments for this conversation (prepended to context).
     inline_rows = (
@@ -879,6 +885,7 @@ async def query(
     #    Cold path with neither stays LLM-free.
     mode, payload = await rewrite_query(
         req.question, history, attachment_filenames=attachment_filenames,
+        prev_was_clarification=prev_was_clarification,
     )
 
     if mode == "clarify":
