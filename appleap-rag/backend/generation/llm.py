@@ -31,34 +31,16 @@ SYSTEM_PROMPT = (
 )
 
 REWRITE_PROMPT = (
-    "You route the user's latest message in an IT-operations assistant. Choose "
-    "ONE action and output EXACTLY ONE line starting with its prefix. Each "
-    "action has a real consequence:\n\n"
-    "QUERY: <self-contained, pronoun-resolved question> — the system RETRIEVES "
-    "relevant documents and answers. For normal questions answerable from the "
-    "documents.\n"
-    "AGGREGATE: <self-contained question, in plain language> — the system runs a "
-    "SQL computation over a structured data table, and it can find the right "
-    "table and columns ITSELF. Use when answering needs a calculation over many "
-    "or all rows: a count, sum, average, min/max, total, or 'how many ...'. "
-    "(A single-row lookup is QUERY, not AGGREGATE.)\n"
-    "CLARIFY: <one short question to the user> — the system STOPS and asks the "
-    "user, spending a turn and returning no answer this turn.\n\n"
-    "HOW TO DECIDE — prefer acting over asking:\n"
-    "- The text after QUERY/AGGREGATE is the user's QUESTION in natural language "
-    "— NEVER write SQL or code there. The system generates any SQL itself.\n"
-    "- A QUERY or AGGREGATE attempt is CHEAP and RECOVERABLE: if it cannot find "
-    "the answer it simply says so. So if EITHER could plausibly resolve the "
-    "message, choose it.\n"
-    "- The system resolves details by inspecting its OWN data (e.g. which "
-    "table, sheet, or column a value lives in). Do NOT ask the user about "
-    "anything the system could discover for itself.\n"
-    "- Use CLARIFY ONLY as a last resort: when no attempt could succeed without "
-    "information that ONLY the user can provide (e.g. a referent with nothing in "
-    "the history or attachments to resolve it).\n"
-    "- Resolve pronouns (it/they/that/this/these) from the history; if the "
-    "message is already self-contained, keep it unchanged.\n"
-    "- Output ONLY the single QUERY:/AGGREGATE:/CLARIFY: line.\n"
+    "You rewrite the user's latest message into a single self-contained question "
+    "for an IT-operations assistant, using the conversation history.\n"
+    "RULES:\n"
+    "- Resolve references (it/they/that/this/these) to their explicit referents "
+    "from the history.\n"
+    "- KEEP THE USER'S OWN WORDING. Do NOT invent or guess table names, column "
+    "names, or values, and do not rephrase into database/schema terms or write "
+    "SQL — a later step maps the question to the data.\n"
+    "- If the message is already self-contained, output it unchanged.\n"
+    "- Output ONLY the rewritten question — no prefix, label, or explanation.\n"
 )
 
 
@@ -137,25 +119,14 @@ async def rewrite_query(
     question: str,
     history: list[dict],
     attachment_filenames: list[str] | None = None,
-    prev_was_clarification: bool = False,
-) -> tuple[str, str]:
-    """Classify the follow-up and return one of:
+) -> str:
+    """Rewrite the latest message into a single self-contained question —
+    resolving references from the history and KEEPING the user's wording (no
+    invented table/column names, no SQL). Returns the rewritten question string.
 
-      ("query",     <self-contained rewritten question>)  → proceed to retrieval
-      ("clarify",   <question to ask the user>)            → skip retrieval, stop
-      ("aggregate", <self-contained rewritten question>)   → tabular-SQL path
-
-    Runs on EVERY turn and may rewrite ANY turn — intent classification is now
-    a permanent front-door (the tabular-SQL route and future routing need it on
-    turn 1), and full reference-resolution/rewriting applies to first turns too,
-    not just when an attachment is present. The cost is one short LLM call per
-    turn — negligible against generation.
-
-    The prompt biases toward leaving an already-self-contained question
-    unchanged, so gratuitous rewording is rare. If the LLM ignores the prefix
-    contract or returns an empty payload, the response degrades to
-    ("query", <original or raw>) so behavior never blocks the user.
-    """
+    Routing is a SEPARATE, table-grounded step (decide_route); this does only the
+    rewrite. Callers skip it on the cold path (no history and no attachments) —
+    there is nothing to resolve."""
     attachment_filenames = attachment_filenames or []
 
     history_text = (
@@ -170,62 +141,38 @@ async def rewrite_query(
     prompt = (
         f"Conversation history:\n{history_text}"
         f"{attachment_block}\n\n"
-        f"Follow-up question: {question}\n\n"
-        f"Your output:"
+        f"Latest message: {question}\n\n"
+        f"Rewritten question:"
     )
 
-    raw = (await _llm_generate(REWRITE_PROMPT, prompt)).strip()
-
-    # Strip a leading code fence in case the model wraps its output.
+    raw = (await _llm_generate(REWRITE_PROMPT, prompt, temperature=0.0)).strip()
     if raw.startswith("```"):
         raw = raw.strip("`").strip()
-
-    upper = raw.upper()
-    if upper.startswith("CLARIFY:"):
-        # Loop-breaker: if we ALREADY clarified last turn and the user replied,
-        # never clarify again — make a best-effort attempt instead. Guarantees
-        # the user can always escape a clarification by responding.
-        if prev_was_clarification:
-            logger.info("rewrite_query CLARIFY suppressed (prev turn was a clarification) — attempting query")
-            return ("query", question)
-        text = raw[len("CLARIFY:"):].strip()
-        if not text:
-            logger.warning("rewrite_query empty CLARIFY payload — falling back to QUERY")
-            return ("query", question)
-        logger.info("rewrite_query CLARIFY: %s", text[:200])
-        return ("clarify", text)
-
-    if upper.startswith("AGGREGATE:"):
-        text = raw[len("AGGREGATE:"):].strip()
-        payload = text or question
-        logger.info("rewrite_query AGGREGATE: %s", payload[:200])
-        return ("aggregate", payload)
-
-    if upper.startswith("QUERY:"):
-        text = raw[len("QUERY:"):].strip()
-        return ("query", text or question)
-
-    # Malformed — the model ignored the prefix contract. Fall back to the
-    # pre-clarification behavior: assume the response IS the rewritten question.
-    # Worst case is current production behavior.
-    logger.warning("rewrite_query missing prefix; using raw=%r", raw[:200])
-    return ("query", raw)
+    return raw or question
 
 
 # ── Tabular-SQL routing + generation (Phase 4) ─────────────────────
 
-SQL_ROUTE_PROMPT = (
-    "You decide how an IT-operations assistant should answer a question: by "
-    "(a) normal document retrieval, or (b) running a SQL query over a structured "
-    "data table.\n\n"
-    "Choose \"sql\" ONLY when answering requires a CALCULATION OVER MANY OR ALL "
-    "ROWS of one of the listed tables — a count, sum, average, min/max, total, "
-    "\"how many\", proportion, or grouping — AND one of the tables actually "
-    "contains the data needed.\n"
-    "Choose \"rag\" when the answer can be read from a few records, when it is "
-    "about unstructured/text content, or when none of the listed tables hold the "
-    "needed data. When unsure, choose \"rag\".\n"
-    "Output EXACTLY ONE JSON object and nothing else."
+ROUTE_PROMPT = (
+    "You route a user's question in an IT-operations assistant. You are given the "
+    "question and the data tables that most closely match it (with their "
+    "columns). Choose ONE route and output ONE JSON object.\n\n"
+    "ROUTES:\n"
+    '- "sql": answer by computing over ONE of the listed tables — a count, sum, '
+    "average, min/max, total, 'how many', or filtering/grouping over many rows. "
+    "The system finds the exact columns and values itself. Give the table number.\n"
+    '- "rag": answer by searching the documents — prose/text, a single-fact '
+    "lookup, or when none of the listed tables hold the needed data.\n"
+    '- "clarify": ask the user ONE short question — ONLY as a last resort, when '
+    "no attempt could succeed without information that ONLY the user can give.\n\n"
+    "PRINCIPLES:\n"
+    "- Prefer acting (sql/rag) over asking; an attempt is cheap and recoverable.\n"
+    "- Use sql when the answer needs a calculation over many/all rows of a listed "
+    "table; use rag for prose or single-fact questions.\n"
+    "- Do NOT clarify about things the system can discover itself (which table, "
+    "column, or value) — that is what sql/rag do.\n"
+    '- Output ONLY this JSON object: {"route": "sql|rag|clarify", "table": '
+    '<number or null>, "clarification": <string or null>, "reason": "<short>"}'
 )
 
 SQL_AGENT_PROMPT = (
@@ -286,39 +233,53 @@ def _strip_sql(text: str) -> str:
     return t.strip()
 
 
-async def decide_sql_route(
-    question: str, candidates: list[dict]
+async def decide_route(
+    question: str,
+    candidates: list[dict],
+    prev_was_clarification: bool = False,
 ) -> dict:
-    """Grounded routing decision: given the question and the retrieved candidate
-    tables, decide "sql" (compute over a table) vs "rag" (normal retrieval).
-    Returns {"route", "table": <1-based index into candidates or None>, "reason"}.
-    Degrades to rag on any parse failure or invalid index — fallback is safe."""
-    if not candidates:
-        return {"route": "rag", "table": None, "reason": "no candidate tables"}
+    """Grounded 3-way route decision, informed by the candidate tables. Returns
+    {"route": "sql"|"rag"|"clarify", "table": <1-based index|None>,
+    "clarification": <str|None>, "reason": <str>}.
 
-    lines = []
-    for i, c in enumerate(candidates, 1):
-        cols = ", ".join(
-            f'{col.get("name")} ({col.get("type", "text")})'
-            for col in (c.get("columns") or [])
-        )
-        lines.append(f'[{i}] "{c.get("table_name")}" — {c.get("description","")} Columns: {cols}')
-    prompt = (
-        f"User question: {question}\n\n"
-        f"Available data tables:\n" + "\n".join(lines) + "\n\n"
-        "Think in ONE sentence about whether answering needs a calculation over "
-        "a whole table, then output the JSON.\n"
-        'JSON: {"route": "sql" or "rag", "table": <table number or null>, "reason": "<short>"}'
-    )
-    raw = (await _llm_generate(SQL_ROUTE_PROMPT, prompt, temperature=0.0)).strip()
+    Safety: degrades to "rag" on any parse problem; a "sql" route needs a valid
+    table index or it falls to "rag"; and a "clarify" is suppressed if we already
+    clarified last turn (loop-breaker — the user can always escape by replying)."""
+    if candidates:
+        lines = []
+        for i, c in enumerate(candidates, 1):
+            cols = ", ".join(
+                f'{col.get("name")} ({col.get("type", "text")})'
+                for col in (c.get("columns") or [])
+            )
+            lines.append(f'[{i}] "{c.get("table_name")}" — {c.get("description","")} Columns: {cols}')
+        tables_block = "Matching data tables:\n" + "\n".join(lines)
+    else:
+        tables_block = "Matching data tables: (none)"
+
+    prompt = f"Question: {question}\n\n{tables_block}\n\nDecide the route. Output the JSON object."
+    raw = (await _llm_generate(ROUTE_PROMPT, prompt, temperature=0.0)).strip()
     data = _extract_json(raw) or {}
-    if data.get("route") != "sql":
-        return {"route": "rag", "table": None, "reason": str(data.get("reason", ""))}
-    idx = data.get("table")
-    if not isinstance(idx, int) or not (1 <= idx <= len(candidates)):
-        return {"route": "rag", "table": None, "reason": "sql chosen without a valid table"}
-    logger.info("decide_sql_route SQL table=%d reason=%s", idx, str(data.get("reason",""))[:160])
-    return {"route": "sql", "table": idx, "reason": str(data.get("reason", ""))}
+
+    route = str(data.get("route", "")).lower().strip()
+    if route not in ("sql", "rag", "clarify"):
+        route = "rag"
+
+    if route == "clarify" and prev_was_clarification:
+        logger.info("decide_route CLARIFY suppressed (prev turn was a clarification) — using rag")
+        route = "rag"
+
+    table = data.get("table") if isinstance(data.get("table"), int) else None
+    if route == "sql" and not (table and candidates and 1 <= table <= len(candidates)):
+        logger.info("decide_route sql without a valid table -> rag")
+        route, table = "rag", None
+
+    clarification = str(data.get("clarification") or "") if route == "clarify" else None
+    if route == "clarify" and not clarification:
+        route = "rag"  # wanted to clarify but gave no question — attempt instead
+
+    logger.info("decide_route route=%s table=%s reason=%s", route, table, str(data.get("reason", ""))[:120])
+    return {"route": route, "table": table, "clarification": clarification, "reason": str(data.get("reason", ""))}
 
 
 async def sql_agent_step(

@@ -31,10 +31,11 @@ from backend.db.connection import async_session, engine, get_session
 from backend.db.models import Base, Chunk, Conversation, ConversationInlineAttachment, Document, Message, User
 from backend.embedding.embedder import embed_batch
 from backend.generation import stream_registry
-from backend.generation.llm import generate_answer_stream, rewrite_query
+from backend.acl import resolve_user_groups
+from backend.generation.llm import decide_route, generate_answer_stream, rewrite_query
 from backend.parsing.parser import parse_text
-from backend.retrieval.sql_router import try_sql_answer
-from backend.retrieval.table_catalog import index_document_tables
+from backend.retrieval.sql_router import run_sql
+from backend.retrieval.table_catalog import index_document_tables, retrieve_tables
 from backend.retrieval.vector_search import search
 from backend.webhooks.nango import router as nango_webhook_router
 
@@ -879,80 +880,79 @@ async def query(
         + [d.title for d in chunked_attachment_rows]
     )
 
-    # 3. Decide: answer the follow-up, or ask a clarifying question?
-    #    Rewrite fires when there's history OR attached files — both
-    #    introduce references the model needs to resolve before retrieval.
-    #    Cold path with neither stays LLM-free.
-    mode, payload = await rewrite_query(
-        req.question, history, attachment_filenames=attachment_filenames,
-        prev_was_clarification=prev_was_clarification,
-    )
+    # 3. ORCHESTRATOR — rewrite, find candidate tables, then ONE grounded route.
+    #
+    # 3a. Rewrite into a self-contained question (resolve references; keep the
+    #     user's wording). Skip on the cold path — nothing to resolve.
+    if history or attachment_filenames:
+        search_query = await rewrite_query(
+            req.question, history, attachment_filenames=attachment_filenames,
+        )
+    else:
+        search_query = req.question
 
-    if mode == "clarify":
-        # No retrieval, no background generation. Persist the user message
-        # and an assistant message containing the clarification, then
-        # fake-stream the clarification text back so the UX matches a
-        # normal answer.
-        clarification = payload
+    # 3b. Find the tables that match the question (grounding for the decision).
+    user_groups = await resolve_user_groups(session, user.email) if user.email else []
+    try:
+        candidates = await retrieve_tables(
+            session, search_query, conversation_id=conv.id,
+            top_k=5, max_distance=0.6,
+            user_email=user.email, user_groups=user_groups,
+        )
+    except Exception:
+        logger.exception("retrieve_tables failed conv=%s", conv.id)
+        candidates = []
+
+    # 3c. One grounded route decision: CLARIFY / RAG / SQL — informed by which
+    #     tables (if any) matched.
+    route_info = await decide_route(
+        search_query, candidates, prev_was_clarification=prev_was_clarification,
+    )
+    route = route_info["route"]
+    logger.info("query_route route=%s conv=%s", route, conv.id)
+
+    if route == "clarify":
+        # No retrieval/generation: persist the clarification and fake-stream it.
+        clarification = route_info.get("clarification") or "Could you clarify your question?"
         assistant_msg_id = str(uuid.uuid4())
-        user_msg = Message(
-            conversation_id=conv.id,
-            role="user",
-            content=req.question,
-        )
-        assistant_msg = Message(
-            id=assistant_msg_id,
-            conversation_id=conv.id,
-            role="assistant",
-            content=clarification,
-            status="completed",
-            model_used=settings.llm_model,
-            sources=[],
-            metadata_={"clarification": True},
-        )
-        session.add(user_msg)
-        session.add(assistant_msg)
+        session.add(Message(conversation_id=conv.id, role="user", content=req.question))
+        session.add(Message(
+            id=assistant_msg_id, conversation_id=conv.id, role="assistant",
+            content=clarification, status="completed", model_used=settings.llm_model,
+            sources=[], metadata_={"clarification": True},
+        ))
         if conv.title == "New Chat":
             conv.title = req.question[:100]
         conv.updated_at = datetime.now(timezone.utc)
         await session.commit()
-
         return StreamingResponse(
             _stream_clarification(conv.id, assistant_msg_id, clarification),
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache, no-transform",
-                "X-Accel-Buffering": "no",
-            },
+            headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
         )
 
-    search_query = payload
-
-    # 4. Grounded tabular-SQL routing (Phase 4). Retrieve candidate tables and,
-    #    if the question needs a computation over one, answer it exactly with
-    #    SQL. try_sql_answer returns None to fall through to normal retrieval —
-    #    the safe default for everything that isn't a confident SQL answer.
-    try:
-        sql_answer = await try_sql_answer(
-            session, search_query, conversation_id=conv.id, user_email=user.email,
-        )
-    except Exception:
-        # The SQL path must never break a query — any failure falls back to RAG.
-        logger.exception("try_sql_answer failed conv=%s -> rag", conv.id)
-        sql_answer = None
-    if mode == "aggregate":
-        logger.info(
-            "query_route rewriter_hint=aggregate took_sql=%s conv=%s",
-            sql_answer is not None, conv.id,
-        )
+    # 4. SQL route — run the data query engine over the table the router chose,
+    #    reusing the candidates we already retrieved. Any failure falls back to
+    #    RAG (the universal safety net), so a route mistake is never fatal.
+    sql_answer = None
+    if route == "sql" and route_info.get("table"):
+        chosen = candidates[route_info["table"] - 1]
+        try:
+            sql_answer = await run_sql(
+                session, search_query, chosen,
+                user_email=user.email, user_groups=user_groups,
+            )
+        except Exception:
+            logger.exception("run_sql failed conv=%s -> rag", conv.id)
+            sql_answer = None
 
     if sql_answer is not None:
         sql_context = sql_answer["context"]
         results = []
         sources = sql_answer["sources"]
     else:
+        # RAG route (also the fallback when the SQL route yields nothing).
         sql_context = None
-        # 4b. Retrieve relevant chunks
         results = await search(
             search_query,
             session,
@@ -960,7 +960,6 @@ async def query(
             conversation_id=conv.id,
             user_email=user.email,
         )
-        # 5. Build source metadata
         sources = [
             {
                 "chunk_id": r.id,
