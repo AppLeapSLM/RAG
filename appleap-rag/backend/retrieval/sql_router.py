@@ -157,16 +157,21 @@ async def _run_sql_agent(conn, tables: list[dict], question: str, schema_text: s
         if action == "giveup":
             return None, None
 
-        if action == "find_value":
-            value = step["value"]
-            if not value:
-                return None, None
-            transcript.append({"value": value, "observation": _find_value(tables, value)})
+        if action == "find_value" and step["value"]:
+            transcript.append({"value": step["value"], "observation": _find_value(tables, step["value"])})
             continue
 
+        # run / final — or a find_value the model mislabeled (SQL in 'sql', no
+        # 'value'): treat that as a diagnostic run rather than giving up.
         sql = step["sql"]
         if not sql:
-            return None, None
+            # Nothing actionable — nudge once (bounded by MAX_AGENT_STEPS) rather
+            # than abandoning the whole attempt on one malformed step.
+            transcript.append({
+                "value": step.get("value", ""),
+                "observation": "No query provided. Use 'run'/'final' with a SQL SELECT, or 'find_value' with a non-empty 'value'.",
+            })
+            continue
         try:
             res = await asyncio.to_thread(run_select, conn, sql)
         except Exception as exc:
