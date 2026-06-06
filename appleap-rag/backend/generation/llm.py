@@ -207,15 +207,29 @@ SQL_ROUTE_PROMPT = (
     "Output EXACTLY ONE JSON object and nothing else."
 )
 
-SQL_GEN_PROMPT = (
-    "You are a DuckDB SQL generator. Given a table schema and a question, write "
-    "ONE read-only SQL SELECT (DuckDB dialect) that answers it.\n"
+SQL_AGENT_PROMPT = (
+    "You are a data analyst answering a question by querying ONE in-memory "
+    "DuckDB database (read-only). You work in steps. At each step you either run "
+    "a query to INSPECT the data, or give the FINAL query whose result answers "
+    "the question.\n\n"
+    "Output EXACTLY ONE JSON object:\n"
+    '  {"thought": "<one short sentence>", "action": "run" | "final" | "giveup", '
+    '"sql": "<a single SELECT>"}\n\n'
+    "ACTIONS:\n"
+    '- "run": execute a diagnostic SELECT and see its result before deciding '
+    '(e.g. SELECT DISTINCT "col" LIMIT 20 to find which column holds a value '
+    "mentioned in the question, or to check a type). Use it whenever you are not "
+    "certain which column or value to use.\n"
+    '- "final": the query whose result IS the answer. Use only when confident.\n'
+    '- "giveup": the available table(s) cannot answer the question.\n\n'
     "RULES:\n"
-    "- Use ONLY the listed tables and columns. Quote every identifier with "
-    "double quotes (columns may contain spaces).\n"
-    "- A single SELECT (a leading WITH/CTE is fine). No INSERT/UPDATE/DELETE/DDL, "
-    "no semicolons, no file or external functions.\n"
-    "- Output ONLY the SQL. No explanation, no code fence."
+    "- Before filtering or grouping by a specific value from the question, FIRST "
+    'verify which column actually contains that value with a "run" query, unless '
+    "the schema's example values already make it obvious.\n"
+    "- One single SELECT (a leading WITH is fine). Quote identifiers with double "
+    "quotes (columns may contain spaces). No INSERT/UPDATE/DELETE/DDL, no "
+    "semicolons, no file/external functions.\n"
+    "- Output ONLY the JSON object."
 )
 
 
@@ -285,18 +299,32 @@ async def decide_sql_route(
     return {"route": "sql", "table": idx, "reason": str(data.get("reason", ""))}
 
 
-async def generate_sql(question: str, schema_text: str) -> str:
-    """Generate a single read-only DuckDB SELECT for `question` against the
-    given schema. Caller MUST still validate (tabular_sql.validate_select)."""
-    prompt = (
-        f"Database schema (DuckDB):\n{schema_text}\n\n"
-        f"Question: {question}\n\n"
-        "Write the SQL query:"
-    )
-    raw = await _llm_generate(SQL_GEN_PROMPT, prompt)
-    sql = _strip_sql(raw)
-    logger.info("generate_sql -> %s", sql[:200])
-    return sql
+async def sql_agent_step(
+    question: str, schema_text: str, transcript: list[dict]
+) -> dict:
+    """One step of the SQL agent loop. Given the schema, the question, and the
+    transcript of prior (query → result/error) steps, decide the next action.
+    Returns {"action": "run"|"final"|"giveup", "sql": str, "thought": str}.
+    Degrades to giveup on parse failure — caller falls back to RAG."""
+    parts = [f"Database schema (DuckDB):\n{schema_text}", f"\nQuestion: {question}"]
+    if transcript:
+        parts.append("\nSteps so far:")
+        for i, step in enumerate(transcript, 1):
+            parts.append(f"[{i}] SQL: {step['sql']}")
+            if "error" in step:
+                parts.append(f"    ERROR: {step['error']}")
+            else:
+                parts.append(f"    RESULT:\n{step['result_preview']}")
+    parts.append("\nYour next step (one JSON object):")
+
+    raw = await _llm_generate(SQL_AGENT_PROMPT, "\n".join(parts))
+    data = _extract_json(raw) or {}
+    action = str(data.get("action", "")).lower().strip()
+    if action not in ("run", "final", "giveup"):
+        action = "giveup"
+    sql = _strip_sql(str(data.get("sql", "") or ""))
+    logger.info("sql_agent_step action=%s sql=%s", action, sql[:160])
+    return {"action": action, "sql": sql, "thought": str(data.get("thought", ""))}
 
 
 # ── Context building ───────────────────────────────────────────────
