@@ -33,6 +33,7 @@ from backend.embedding.embedder import embed_batch
 from backend.generation import stream_registry
 from backend.generation.llm import generate_answer_stream, rewrite_query
 from backend.parsing.parser import parse_text
+from backend.retrieval.sql_router import try_sql_answer
 from backend.retrieval.table_catalog import index_document_tables
 from backend.retrieval.vector_search import search
 from backend.webhooks.nango import router as nango_webhook_router
@@ -655,14 +656,19 @@ async def _run_generation(
     history: list[dict],
     inline_attachments: list,
     rewritten_query: str,
+    sql_context: str | None = None,
 ) -> None:
     """Background task: stream tokens from Ollama into the registry, then
     persist the final answer to the assistant message row. Runs independently
-    of the HTTP request that started it — survives client disconnect."""
+    of the HTTP request that started it — survives client disconnect.
+
+    `sql_context` (tabular-SQL path): when set, the generator answers from this
+    exact computed result instead of the retrieved chunks."""
     persist_task = asyncio.create_task(_persist_loop(state))
     try:
         async for delta in generate_answer_stream(
             question, chunks, history=history, inline_attachments=inline_attachments,
+            precomputed_context=sql_context,
         ):
             stream_registry.push_delta(state, delta)
 
@@ -913,36 +919,43 @@ async def query(
             },
         )
 
-    if mode == "aggregate":
-        # Phase 3 (detection-only): log the routing decision so we can evaluate
-        # classification quality against the eval set without changing answers.
-        # Phase 4 replaces this branch with the DuckDB tabular-SQL path; for now
-        # it falls through and is answered by normal retrieval like any query.
-        logger.info(
-            "query_route AGGREGATE detected conv=%s q=%r", conv.id, payload[:200]
-        )
-
     search_query = payload
 
-    # 4. Retrieve relevant chunks
-    results = await search(
-        search_query,
-        session,
-        top_k=req.top_k,
-        conversation_id=conv.id,
-        user_email=user.email,
-    )
+    # 4. Grounded tabular-SQL routing (Phase 4). Retrieve candidate tables and,
+    #    if the question needs a computation over one, answer it exactly with
+    #    SQL. try_sql_answer returns None to fall through to normal retrieval —
+    #    the safe default for everything that isn't a confident SQL answer.
+    sql_answer = await try_sql_answer(session, search_query, conversation_id=conv.id)
+    if mode == "aggregate":
+        logger.info(
+            "query_route rewriter_hint=aggregate took_sql=%s conv=%s",
+            sql_answer is not None, conv.id,
+        )
 
-    # 5. Build source metadata
-    sources = [
-        {
-            "chunk_id": r.id,
-            "document_id": r.document_id,
-            "content_preview": r.content[:200],
-            "chunk_index": r.chunk_index,
-        }
-        for r in results
-    ]
+    if sql_answer is not None:
+        sql_context = sql_answer["context"]
+        results = []
+        sources = sql_answer["sources"]
+    else:
+        sql_context = None
+        # 4b. Retrieve relevant chunks
+        results = await search(
+            search_query,
+            session,
+            top_k=req.top_k,
+            conversation_id=conv.id,
+            user_email=user.email,
+        )
+        # 5. Build source metadata
+        sources = [
+            {
+                "chunk_id": r.id,
+                "document_id": r.document_id,
+                "content_preview": r.content[:200],
+                "chunk_index": r.chunk_index,
+            }
+            for r in results
+        ]
 
     # 6. Persist user message + empty assistant message (status='streaming')
     #    immediately so the row exists for late subscribers / resume.
@@ -980,6 +993,7 @@ async def query(
         history=history,
         inline_attachments=inline_attachments,
         rewritten_query=search_query,
+        sql_context=sql_context,
     ))
 
     return StreamingResponse(

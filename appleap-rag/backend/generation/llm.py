@@ -191,6 +191,114 @@ async def rewrite_query(
     return ("query", raw)
 
 
+# ── Tabular-SQL routing + generation (Phase 4) ─────────────────────
+
+SQL_ROUTE_PROMPT = (
+    "You decide how an IT-operations assistant should answer a question: by "
+    "(a) normal document retrieval, or (b) running a SQL query over a structured "
+    "data table.\n\n"
+    "Choose \"sql\" ONLY when answering requires a CALCULATION OVER MANY OR ALL "
+    "ROWS of one of the listed tables — a count, sum, average, min/max, total, "
+    "\"how many\", proportion, or grouping — AND one of the tables actually "
+    "contains the data needed.\n"
+    "Choose \"rag\" when the answer can be read from a few records, when it is "
+    "about unstructured/text content, or when none of the listed tables hold the "
+    "needed data. When unsure, choose \"rag\".\n"
+    "Output EXACTLY ONE JSON object and nothing else."
+)
+
+SQL_GEN_PROMPT = (
+    "You are a DuckDB SQL generator. Given a table schema and a question, write "
+    "ONE read-only SQL SELECT (DuckDB dialect) that answers it.\n"
+    "RULES:\n"
+    "- Use ONLY the listed tables and columns. Quote every identifier with "
+    "double quotes (columns may contain spaces).\n"
+    "- A single SELECT (a leading WITH/CTE is fine). No INSERT/UPDATE/DELETE/DDL, "
+    "no semicolons, no file or external functions.\n"
+    "- Output ONLY the SQL. No explanation, no code fence."
+)
+
+
+def _extract_json(text: str) -> dict | None:
+    """Pull the JSON object out of a model response that may include reasoning
+    before/after it. Returns None if nothing parses."""
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        pass
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _strip_sql(text: str) -> str:
+    """Strip code fences / a leading 'SQL:' label from a generated SQL string."""
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.strip("`")
+        # drop an optional language tag on the first line (```sql)
+        if "\n" in t:
+            first, rest = t.split("\n", 1)
+            if first.strip().lower() in ("sql", "duckdb"):
+                t = rest
+    if t.lower().startswith("sql:"):
+        t = t[4:]
+    return t.strip()
+
+
+async def decide_sql_route(
+    question: str, candidates: list[dict]
+) -> dict:
+    """Grounded routing decision: given the question and the retrieved candidate
+    tables, decide "sql" (compute over a table) vs "rag" (normal retrieval).
+    Returns {"route", "table": <1-based index into candidates or None>, "reason"}.
+    Degrades to rag on any parse failure or invalid index — fallback is safe."""
+    if not candidates:
+        return {"route": "rag", "table": None, "reason": "no candidate tables"}
+
+    lines = []
+    for i, c in enumerate(candidates, 1):
+        cols = ", ".join(
+            f'{col.get("name")} ({col.get("type", "text")})'
+            for col in (c.get("columns") or [])
+        )
+        lines.append(f'[{i}] "{c.get("table_name")}" — {c.get("description","")} Columns: {cols}')
+    prompt = (
+        f"User question: {question}\n\n"
+        f"Available data tables:\n" + "\n".join(lines) + "\n\n"
+        "Think in ONE sentence about whether answering needs a calculation over "
+        "a whole table, then output the JSON.\n"
+        'JSON: {"route": "sql" or "rag", "table": <table number or null>, "reason": "<short>"}'
+    )
+    raw = (await _llm_generate(SQL_ROUTE_PROMPT, prompt)).strip()
+    data = _extract_json(raw) or {}
+    if data.get("route") != "sql":
+        return {"route": "rag", "table": None, "reason": str(data.get("reason", ""))}
+    idx = data.get("table")
+    if not isinstance(idx, int) or not (1 <= idx <= len(candidates)):
+        return {"route": "rag", "table": None, "reason": "sql chosen without a valid table"}
+    logger.info("decide_sql_route SQL table=%d reason=%s", idx, str(data.get("reason",""))[:160])
+    return {"route": "sql", "table": idx, "reason": str(data.get("reason", ""))}
+
+
+async def generate_sql(question: str, schema_text: str) -> str:
+    """Generate a single read-only DuckDB SELECT for `question` against the
+    given schema. Caller MUST still validate (tabular_sql.validate_select)."""
+    prompt = (
+        f"Database schema (DuckDB):\n{schema_text}\n\n"
+        f"Question: {question}\n\n"
+        "Write the SQL query:"
+    )
+    raw = await _llm_generate(SQL_GEN_PROMPT, prompt)
+    sql = _strip_sql(raw)
+    logger.info("generate_sql -> %s", sql[:200])
+    return sql
+
+
 # ── Context building ───────────────────────────────────────────────
 
 
@@ -392,11 +500,19 @@ async def generate_answer_stream(
     chunks: list[Chunk],
     history: list[dict] | None = None,
     inline_attachments: list | None = None,
+    precomputed_context: str | None = None,
 ) -> AsyncIterator[str]:
     """Streaming counterpart of `generate_answer`. Builds the same prompt
     and yields token deltas as Ollama generates them.
+
+    `precomputed_context` (tabular-SQL path): when provided, it is used as the
+    context block verbatim instead of building one from `chunks` — so the model
+    answers from the exact computed SQL result rather than retrieved fragments.
     """
-    context_block = build_context_block(chunks, inline_attachments=inline_attachments)
+    if precomputed_context is not None:
+        context_block = precomputed_context
+    else:
+        context_block = build_context_block(chunks, inline_attachments=inline_attachments)
     history_block = build_history_block(history) if history else ""
 
     parts: list[str] = []
