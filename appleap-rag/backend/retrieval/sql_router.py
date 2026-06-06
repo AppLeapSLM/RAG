@@ -50,7 +50,7 @@ DEFAULT_MAX_DISTANCE = 0.6
 CANDIDATE_TOP_K = 5
 # Max LLM steps in the SQL agent loop (diagnostics + final). Bounds latency/cost
 # while leaving room to inspect the data and repair one or two wrong attempts.
-MAX_AGENT_STEPS = 4
+MAX_AGENT_STEPS = 5
 
 
 async def try_sql_answer(
@@ -131,6 +131,7 @@ async def _run_sql_agent(conn, question: str, schema_text: str):
     This generalises over wrong-column, wrong-value, and type-error failures
     without per-case heuristics — the model discovers the fix by querying."""
     transcript: list[dict] = []
+    challenged = False
     for _ in range(MAX_AGENT_STEPS):
         step = await sql_agent_step(question, schema_text, transcript)
         action, sql = step["action"], step["sql"]
@@ -141,10 +142,49 @@ async def _run_sql_agent(conn, question: str, schema_text: str):
         except Exception as exc:
             transcript.append({"sql": sql, "error": str(exc)[:300]})
             continue
+
         if action == "final":
+            # A 0 / NULL / empty result is the ambiguous case: it may be correct,
+            # or the query may have filtered the wrong column/value. Don't accept
+            # it blind. Challenge it once — force a verification round — and if it
+            # is STILL suspicious afterwards, fall back to RAG rather than present
+            # a likely-wrong "0". (Cost: a genuinely-zero answer also degrades to
+            # RAG, which is safe; we never assert a 0 we couldn't verify.)
+            if _is_suspicious(res):
+                if challenged:
+                    logger.info("sql_router: final still 0/empty after verify -> rag")
+                    return None, None
+                challenged = True
+                transcript.append({
+                    "sql": sql,
+                    "result_preview": _preview(res) + (
+                        "\n<- This is 0/empty. Before finalizing, VERIFY you used "
+                        "the right column AND value: run a diagnostic query (e.g. "
+                        'SELECT DISTINCT on the column) to confirm where the value '
+                        "actually appears. If it is genuinely absent, finalize anyway."
+                    ),
+                })
+                continue
             return sql, res
+
         transcript.append({"sql": sql, "result_preview": _preview(res)})
     return None, None
+
+
+def _is_suspicious(result: dict) -> bool:
+    """A result that warrants a verification round: zero rows, or a single
+    scalar that is NULL or 0 (the classic 'filtered the wrong column' signature
+    for a count/sum)."""
+    rows = result["rows"]
+    if not rows:
+        return True
+    if len(rows) == 1 and len(rows[0]) == 1:
+        v = rows[0][0]
+        if v is None:
+            return True
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v == 0:
+            return True
+    return False
 
 
 def _preview(result: dict, max_rows: int = 15, max_cell: int = 60) -> str:
