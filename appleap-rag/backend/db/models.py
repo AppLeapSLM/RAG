@@ -84,6 +84,42 @@ class Chunk(Base):
     )
 
 
+class TableCatalog(Base):
+    """One row per queryable table — a CSV/TSV file, or one Excel sheet — the
+    index the router retrieves over to decide, WITH evidence, whether a question
+    needs a SQL computation and which table to run it on.
+
+    Populated at (re-)ingest from the document's table_schema (Phase 1). The
+    embedding is of `description` (filename + columns + row count), so finding
+    the relevant table(s) for a query is a top-K pgvector search — the same
+    retrieve-then-decide pattern as chunk retrieval, applied to schemas. That is
+    what keeps routing scalable: the router sees only the few relevant tables,
+    never the whole catalog. FK ON DELETE CASCADE so entries die with their doc.
+    """
+    __tablename__ = "table_catalog"
+
+    id: Mapped[str] = mapped_column(
+        String, primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    document_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # Name SQL generation will reference; matches tabular_sql.load_tables naming.
+    table_name: Mapped[str] = mapped_column(String, nullable=False)
+    # Set only for Excel workbooks with named sheets; NULL for CSV/TSV.
+    sheet_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    columns: Mapped[list] = mapped_column(JSONB, default=list)  # [{name, type}]
+    row_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding = mapped_column(Vector(settings.embedding_dim))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
 class User(Base):
     """Authenticated user. Email is the canonical identity (also used as
     user_id in the user_groups ACL cache and as the Bearer-token subject).

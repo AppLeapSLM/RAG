@@ -33,6 +33,7 @@ from backend.embedding.embedder import embed_batch
 from backend.generation import stream_registry
 from backend.generation.llm import generate_answer_stream, rewrite_query
 from backend.parsing.parser import parse_text
+from backend.retrieval.table_catalog import index_document_tables
 from backend.retrieval.vector_search import search
 from backend.webhooks.nango import router as nango_webhook_router
 
@@ -589,6 +590,21 @@ async def ingest_file(
             session.add(chunk)
 
         await session.commit()
+
+        # Catalog any tabular tables for evidence-grounded routing. Separate,
+        # best-effort transaction so a catalog/embedding failure never rolls
+        # back the ingested document + chunks.
+        try:
+            indexed = await index_document_tables(
+                session, doc.id, file.filename, doc_meta
+            )
+            if indexed:
+                await session.commit()
+                logger.info("table_catalog doc=%s tables=%d", doc.id, indexed)
+        except Exception:
+            await session.rollback()
+            logger.exception("table_catalog indexing failed doc=%s", doc.id)
+
         return IngestResponse(document_id=doc.id, chunks_stored=len(chunks))
 
     finally:
@@ -1299,6 +1315,24 @@ async def upload_attachment(
             session.add(chunk)
 
         await session.commit()
+
+        # Catalog tabular attachment tables for routing (best-effort, separate
+        # txn — never block/rollback the attachment ingest on it).
+        try:
+            indexed = await index_document_tables(
+                session, doc.id, file.filename, doc_meta
+            )
+            if indexed:
+                await session.commit()
+                logger.info(
+                    "table_catalog attachment doc=%s tables=%d", doc.id, indexed
+                )
+        except Exception:
+            await session.rollback()
+            logger.exception(
+                "table_catalog indexing failed attachment doc=%s", doc.id
+            )
+
         logger.info(
             "chunked_attachment conv=%s file=%s bytes=%d chunks=%d",
             conversation_id, file.filename, text_bytes, len(chunks),
