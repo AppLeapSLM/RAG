@@ -358,6 +358,8 @@ def main():
     parser.add_argument("--output", "-o", help="Save detailed results to JSON file")
     parser.add_argument("--skip-conversations", action="store_true", help="Skip multi-turn eval")
     parser.add_argument("--skip-singleturn", action="store_true", help="Skip single-turn eval")
+    parser.add_argument("--email", help="Login email — /query requires Bearer auth")
+    parser.add_argument("--password", help="Login password")
     args = parser.parse_args()
 
     eval_dir = Path(__file__).parent
@@ -371,6 +373,21 @@ def main():
     except Exception as e:
         print(f"ERROR: Cannot reach API at {args.api_url}: {e}")
         sys.exit(1)
+
+    # /query requires Bearer auth — log in and set the header for all requests.
+    if args.email and args.password:
+        try:
+            lr = client.post(
+                f"{args.api_url}/auth/login",
+                json={"email": args.email, "password": args.password},
+                timeout=10.0,
+            )
+            lr.raise_for_status()
+            client.headers["Authorization"] = f"Bearer {lr.json()['access_token']}"
+            print(f"Authenticated as {args.email}")
+        except Exception as e:
+            print(f"ERROR: login failed: {e}")
+            sys.exit(1)
 
     combined: dict = {"top_k": args.top_k}
 
