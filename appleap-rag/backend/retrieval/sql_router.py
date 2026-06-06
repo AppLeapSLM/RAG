@@ -33,7 +33,7 @@ from backend.generation.llm import decide_sql_route, generate_sql
 from backend.retrieval.table_catalog import retrieve_tables
 from backend.retrieval.tabular_sql import (
     build_connection,
-    describe_tables,
+    describe_tables_for_sql,
     load_tables,
     run_select,
 )
@@ -81,7 +81,7 @@ async def try_sql_answer(
         logger.info("sql_router: chosen doc %s not rebuildable -> rag", chosen["document_id"])
         return None
 
-    schema_text = describe_tables(tables)
+    schema_text = describe_tables_for_sql(tables)
     sql = await generate_sql(question, schema_text)
 
     try:

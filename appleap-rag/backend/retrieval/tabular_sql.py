@@ -82,6 +82,37 @@ def describe_tables(tables: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def describe_tables_for_sql(
+    tables: list[dict[str, Any]], max_samples: int = 5
+) -> str:
+    """Richer schema text for SQL GENERATION: each column with its type AND a
+    few distinct sample values. The sample values are essential schema-linking
+    signal — without them the model can't map an entity in the question (e.g.
+    "BITO trades") to the column that actually holds it (Stock Name, not Trade
+    Type). One line per column.
+    """
+    lines: list[str] = []
+    for t in tables:
+        rows = t.get("rows", [])
+        lines.append(f'Table "{t["name"]}" ({t.get("row_count", len(rows))} rows):')
+        for c in t["columns"]:
+            name = c["name"]
+            duck_type = _DUCKDB_TYPE.get(c.get("type", "text"), "VARCHAR")
+            samples: list[str] = []
+            for r in rows:
+                v = r.get(name)
+                if v is None or v == "":
+                    continue
+                sv = str(v)
+                if sv not in samples:
+                    samples.append(sv)
+                    if len(samples) >= max_samples:
+                        break
+            example = f"  e.g. {', '.join(samples)}" if samples else ""
+            lines.append(f'  "{name}" {duck_type}{example}')
+    return "\n".join(lines)
+
+
 def build_connection(tables: list[dict[str, Any]]):
     """Build an in-memory DuckDB connection holding every table, correctly
     typed. Values that fail their column's cast become NULL (TRY_CAST) rather
