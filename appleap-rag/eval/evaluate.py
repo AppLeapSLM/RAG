@@ -56,6 +56,34 @@ def load_conversations(path: Path) -> list[dict]:
         return json.load(f)
 
 
+def _sse_query(client, api_url: str, payload: dict):
+    """POST /query and consume the Server-Sent Events stream (the endpoint
+    streams, it no longer returns JSON). Returns (answer, sources,
+    conversation_id): a 'start' event carries sources + conversation_id, 'delta'
+    events carry text, and an 'error' event raises."""
+    answer, sources, conv_id = "", [], None
+    with client.stream("POST", f"{api_url}/query", json=payload, timeout=300.0) as r:
+        r.raise_for_status()
+        for line in r.iter_lines():
+            if not line or not line.startswith("data:"):
+                continue
+            try:
+                ev = json.loads(line[5:].strip())
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(ev, dict):
+                continue
+            if "sources" in ev:
+                sources = ev["sources"]
+            if ev.get("conversation_id"):
+                conv_id = ev["conversation_id"]
+            if "text" in ev:
+                answer += ev["text"]
+            if ev.get("error"):
+                raise RuntimeError(ev["error"])
+    return answer, sources, conv_id
+
+
 def is_refusal_response(answer: str) -> bool:
     """True if the answer matches any known refusal pattern."""
     return bool(REFUSAL_RE.search(answer))
@@ -127,20 +155,13 @@ def evaluate_retrieval(
         cat["total"] += 1
 
         try:
-            response = client.post(
-                f"{api_url}/query",
-                json={"question": question, "top_k": top_k},
-                timeout=300.0,
+            answer, sources, _ = _sse_query(
+                client, api_url, {"question": question, "top_k": top_k}
             )
-            response.raise_for_status()
-            data = response.json()
         except Exception as e:
             print(f"  [{qid}] ERROR: {e}")
             results["details"].append({"id": qid, "question": question, "error": str(e)})
             continue
-
-        answer = data["answer"]
-        sources = data["sources"]
 
         # Refusal questions are scored on the answer pattern, not retrieval
         if category == "refusal":
@@ -233,9 +254,7 @@ def evaluate_conversations(
                 payload["conversation_id"] = conversation_id
 
             try:
-                response = client.post(f"{api_url}/query", json=payload, timeout=300.0)
-                response.raise_for_status()
-                data = response.json()
+                answer, sources, conv_started = _sse_query(client, api_url, payload)
             except Exception as e:
                 print(f"    [T{i}] ERROR: {e}")
                 trace_detail["turns"].append({"turn": i, "error": str(e)})
@@ -243,9 +262,7 @@ def evaluate_conversations(
                 continue
 
             if conversation_id is None:
-                conversation_id = data.get("conversation_id")
-
-            sources = data.get("sources", [])
+                conversation_id = conv_started
             recall, mrr, hit = score_retrieval(expected_sources, sources)
 
             results["total_turns"] += 1
@@ -262,7 +279,7 @@ def evaluate_conversations(
                 "recall": recall,
                 "mrr": mrr,
                 "hit": bool(hit),
-                "answer_preview": data.get("answer", "")[:140],
+                "answer_preview": (answer or "")[:140],
             })
 
             if verbose:
