@@ -19,7 +19,22 @@ import csv
 from pathlib import Path
 
 from backend.db.connection import async_session
-from backend.retrieval.sql_router import try_sql_answer
+from backend.generation.llm import decide_route
+from backend.retrieval.sql_router import run_sql
+from backend.retrieval.table_catalog import retrieve_tables
+
+
+async def _orchestrate(s, q):
+    """Replicate the grounded orchestrator path (corpus scope): retrieve
+    candidate tables → route decision → run SQL. Returns (route, answer|None)."""
+    candidates = await retrieve_tables(
+        s, q, conversation_id=None, top_k=5, max_distance=0.6, user_email=None,
+    )
+    info = await decide_route(q, candidates)
+    if info["route"] == "sql" and info["table"]:
+        ans = await run_sql(s, q, candidates[info["table"] - 1], user_email=None)
+        return ("sql", ans) if ans else ("rag", None)  # SQL fell back to RAG
+    return info["route"], None
 
 FILES = ["cmdb-production.csv", "cmdb-databases.csv", "cmdb-full-export.csv"]
 
@@ -87,11 +102,10 @@ async def main(data_dir: str):
     passed = 0
     async with async_session() as s:
         for q, exp_route, exp_val in cases:
-            ans = await try_sql_answer(s, q, conversation_id=None, user_email=None)
-            route = "sql" if ans else "rag"
+            route, ans = await _orchestrate(s, q)
             if exp_route == "rag":
-                ok = route == "rag"
-                print(f"[{'PASS' if ok else 'FAIL'}] route={route} (want rag) | {q[:58]}")
+                ok = route != "sql"  # rag or clarify — just must not be SQL
+                print(f"[{'PASS' if ok else 'FAIL'}] route={route} (want non-sql) | {q[:58]}")
             else:
                 val = _scalar(ans)
                 ok = route == "sql" and val is not None and val == float(exp_val)
