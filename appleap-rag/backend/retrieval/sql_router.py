@@ -93,7 +93,7 @@ async def try_sql_answer(
         logger.warning("sql_router: build_connection failed (%s) -> rag", exc)
         return None
     try:
-        sql, result = await _run_sql_agent(conn, question, schema_text)
+        sql, result = await _run_sql_agent(conn, tables, question, schema_text)
     finally:
         conn.close()
 
@@ -120,22 +120,37 @@ async def try_sql_answer(
     }
 
 
-async def _run_sql_agent(conn, question: str, schema_text: str):
-    """Bounded ReAct loop. The model issues diagnostic "run" queries to inspect
-    the data (e.g. find which column holds a value) and a "final" query whose
-    result is the answer. Returns (sql, result) on success, (None, None) if it
-    gives up or never finalizes.
+async def _run_sql_agent(conn, tables: list[dict], question: str, schema_text: str):
+    """Bounded ReAct tool-use loop. Each step the model picks a tool:
+      - run        : execute a diagnostic SELECT,
+      - find_value : locate which column(s) hold a literal (one scan, any width),
+      - final      : the answer query,
+      - giveup     : the tables can't answer it.
+    Returns (sql, result) on success, (None, None) otherwise.
 
-    Every query goes through the same validated, read-only execution path; a
-    query that errors becomes feedback the model repairs from on the next step.
-    This generalises over wrong-column, wrong-value, and type-error failures
-    without per-case heuristics — the model discovers the fix by querying."""
+    Tools are dispatched below; adding a new one (column stats, row sampling…)
+    is a new branch + a transcript entry, not a loop rewrite. Every query still
+    goes through the validated read-only path; an error becomes feedback the
+    model repairs from. This generalises over wrong-column/value and type-error
+    failures without per-case heuristics — the model discovers the fix."""
     transcript: list[dict] = []
     challenged = False
     for _ in range(MAX_AGENT_STEPS):
         step = await sql_agent_step(question, schema_text, transcript)
-        action, sql = step["action"], step["sql"]
-        if action == "giveup" or not sql:
+        action = step["action"]
+
+        if action == "giveup":
+            return None, None
+
+        if action == "find_value":
+            value = step["value"]
+            if not value:
+                return None, None
+            transcript.append({"value": value, "observation": _find_value(tables, value)})
+            continue
+
+        sql = step["sql"]
+        if not sql:
             return None, None
         try:
             res = await asyncio.to_thread(run_select, conn, sql)
@@ -185,6 +200,39 @@ def _is_suspicious(result: dict) -> bool:
         if isinstance(v, (int, float)) and not isinstance(v, bool) and v == 0:
             return True
     return False
+
+
+def _find_value(tables: list[dict], value: str, max_cols: int = 8) -> str:
+    """Locate which column(s) contain `value`, scanning every column of every
+    table in ONE pass — cost is independent of table width, so it scales where
+    column-by-column probing does not. Exact (case-insensitive) match preferred;
+    falls back to partial (contains). General over any value shape — the agent
+    supplies the value it reasoned about; no per-shape extraction heuristic."""
+    needle = value.strip().lower()
+    if not needle:
+        return "no value given."
+    exact: list[str] = []
+    partial: list[str] = []
+    for t in tables:
+        for col in t["columns"]:
+            name = col["name"]
+            vals = [
+                str(r.get(name)).strip().lower()
+                for r in t["rows"]
+                if r.get(name) not in (None, "")
+            ]
+            if any(v == needle for v in vals):
+                exact.append(f'table "{t["name"]}" column "{name}"')
+            elif any(needle in v for v in vals):
+                partial.append(f'table "{t["name"]}" column "{name}"')
+    if exact:
+        return f'"{value}" is an exact value in: ' + "; ".join(exact[:max_cols])
+    if partial:
+        return (
+            f'"{value}" is not an exact value, but appears within: '
+            + "; ".join(partial[:max_cols])
+        )
+    return f'"{value}" was not found in any column.'
 
 
 def _preview(result: dict, max_rows: int = 15, max_cell: int = 60) -> str:

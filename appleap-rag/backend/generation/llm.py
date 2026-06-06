@@ -64,14 +64,27 @@ REWRITE_PROMPT = (
 # ── Low-level LLM call ─────────────────────────────────────────────
 
 
-async def _llm_generate(system: str, prompt: str, model: str | None = None) -> str:
+async def _llm_generate(
+    system: str,
+    prompt: str,
+    model: str | None = None,
+    temperature: float | None = None,
+) -> str:
     """Send a prompt to the LLM and return the response text.
 
     This is the single point of contact with the inference backend.
     Currently uses Ollama /api/generate. When the backend changes,
     only this function needs updating.
+
+    `temperature`: set 0.0 for structured/decision calls (routing, SQL agent)
+    so they are near-deterministic — these are reasoning tasks, not creative
+    writing, and default sampling makes them inconsistent run-to-run.
     """
     model = model or settings.llm_model
+
+    options: dict = {"num_ctx": settings.llm_num_ctx}
+    if temperature is not None:
+        options["temperature"] = temperature
 
     async with httpx.AsyncClient() as client:
         response = await client.post(
@@ -81,7 +94,7 @@ async def _llm_generate(system: str, prompt: str, model: str | None = None) -> s
                 "system": system,
                 "prompt": prompt,
                 "stream": False,
-                "options": {"num_ctx": settings.llm_num_ctx},
+                "options": options,
             },
             timeout=600.0,
         )
@@ -209,23 +222,24 @@ SQL_ROUTE_PROMPT = (
 
 SQL_AGENT_PROMPT = (
     "You are a data analyst answering a question by querying ONE in-memory "
-    "DuckDB database (read-only). You work in steps. At each step you either run "
-    "a query to INSPECT the data, or give the FINAL query whose result answers "
-    "the question.\n\n"
+    "DuckDB database (read-only). You work in steps, choosing a tool each step.\n\n"
     "Output EXACTLY ONE JSON object:\n"
-    '  {"thought": "<one short sentence>", "action": "run" | "final" | "giveup", '
-    '"sql": "<a single SELECT>"}\n\n'
-    "ACTIONS:\n"
-    '- "run": execute a diagnostic SELECT and see its result before deciding '
-    '(e.g. SELECT DISTINCT "col" LIMIT 20 to find which column holds a value '
-    "mentioned in the question, or to check a type). Use it whenever you are not "
-    "certain which column or value to use.\n"
-    '- "final": the query whose result IS the answer. Use only when confident.\n'
-    '- "giveup": the available table(s) cannot answer the question.\n\n'
+    '  {"thought": "<one short sentence>", "action": '
+    '"run"|"find_value"|"final"|"giveup", '
+    '"sql": "<a single SELECT, for run/final>", "value": "<for find_value>"}\n\n'
+    "TOOLS:\n"
+    '- "run": execute a diagnostic SELECT to inspect the data before deciding '
+    "(e.g. SELECT DISTINCT, or check a type/range).\n"
+    '- "find_value": locate which column(s) contain a literal value from the '
+    'question — put the value in the "value" field. It checks ALL columns at '
+    "once, so use it (instead of guessing a column) whenever you must filter by "
+    "a value and the right column is not obvious from the example values.\n"
+    '- "final": the query whose result IS the answer. Use only when confident '
+    "the column(s) and value(s) are correct.\n"
+    '- "giveup": the available table(s) genuinely cannot answer the question.\n\n'
     "RULES:\n"
-    "- Before filtering or grouping by a specific value from the question, FIRST "
-    'verify which column actually contains that value with a "run" query, unless '
-    "the schema's example values already make it obvious.\n"
+    "- Before filtering or grouping by a specific value from the question, make "
+    "sure you know which column holds it — use find_value if it is not obvious.\n"
     "- One single SELECT (a leading WITH is fine). Quote identifiers with double "
     "quotes (columns may contain spaces). No INSERT/UPDATE/DELETE/DDL, no "
     "semicolons, no file/external functions.\n"
@@ -288,7 +302,7 @@ async def decide_sql_route(
         "a whole table, then output the JSON.\n"
         'JSON: {"route": "sql" or "rag", "table": <table number or null>, "reason": "<short>"}'
     )
-    raw = (await _llm_generate(SQL_ROUTE_PROMPT, prompt)).strip()
+    raw = (await _llm_generate(SQL_ROUTE_PROMPT, prompt, temperature=0.0)).strip()
     data = _extract_json(raw) or {}
     if data.get("route") != "sql":
         return {"route": "rag", "table": None, "reason": str(data.get("reason", ""))}
@@ -310,21 +324,26 @@ async def sql_agent_step(
     if transcript:
         parts.append("\nSteps so far:")
         for i, step in enumerate(transcript, 1):
-            parts.append(f"[{i}] SQL: {step['sql']}")
-            if "error" in step:
-                parts.append(f"    ERROR: {step['error']}")
+            if "observation" in step:  # a tool result (e.g. find_value)
+                parts.append(f'[{i}] find_value("{step["value"]}") -> {step["observation"]}')
+            elif "error" in step:
+                parts.append(f"[{i}] SQL: {step['sql']}\n    ERROR: {step['error']}")
             else:
-                parts.append(f"    RESULT:\n{step['result_preview']}")
+                parts.append(f"[{i}] SQL: {step['sql']}\n    RESULT:\n{step['result_preview']}")
     parts.append("\nYour next step (one JSON object):")
 
-    raw = await _llm_generate(SQL_AGENT_PROMPT, "\n".join(parts))
+    raw = await _llm_generate(SQL_AGENT_PROMPT, "\n".join(parts), temperature=0.0)
     data = _extract_json(raw) or {}
     action = str(data.get("action", "")).lower().strip()
-    if action not in ("run", "final", "giveup"):
+    if action not in ("run", "find_value", "final", "giveup"):
         action = "giveup"
     sql = _strip_sql(str(data.get("sql", "") or ""))
-    logger.info("sql_agent_step action=%s sql=%s", action, sql[:160])
-    return {"action": action, "sql": sql, "thought": str(data.get("thought", ""))}
+    value = str(data.get("value", "") or "").strip()
+    logger.info("sql_agent_step action=%s sql=%s value=%s", action, sql[:140], value[:60])
+    return {
+        "action": action, "sql": sql, "value": value,
+        "thought": str(data.get("thought", "")),
+    }
 
 
 # ── Context building ───────────────────────────────────────────────
