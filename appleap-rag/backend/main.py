@@ -925,7 +925,14 @@ async def query(
     #    if the question needs a computation over one, answer it exactly with
     #    SQL. try_sql_answer returns None to fall through to normal retrieval —
     #    the safe default for everything that isn't a confident SQL answer.
-    sql_answer = await try_sql_answer(session, search_query, conversation_id=conv.id)
+    try:
+        sql_answer = await try_sql_answer(
+            session, search_query, conversation_id=conv.id, user_email=user.email,
+        )
+    except Exception:
+        # The SQL path must never break a query — any failure falls back to RAG.
+        logger.exception("try_sql_answer failed conv=%s -> rag", conv.id)
+        sql_answer = None
     if mode == "aggregate":
         logger.info(
             "query_route rewriter_hint=aggregate took_sql=%s conv=%s",

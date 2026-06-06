@@ -17,10 +17,14 @@ Returning None means "I did not produce a confident SQL answer" — the caller
 runs normal RAG. This is the safe default: a missed aggregation degrades to
 today's behavior, never to a crash.
 
-SECURITY NOTE (known gap, must fix before multi-tenant): retrieve_tables scopes
-to corpus + this conversation's attachments but does NOT yet apply per-document
-ACL. The chunk-retrieval path does (acl_filter). For a single-tenant deployment
-this matches today's reality; before multi-tenant, the catalog needs ACL.
+ACL: when user_email is passed, this path enforces the SAME per-chunk ACL as
+normal retrieval — retrieve_tables only offers a table the user can see a chunk
+of, and load_tables rebuilds the table from ONLY the user's visible rows, so a
+SQL aggregate can never expose data the user couldn't retrieve normally. A user
+with no visible rows gets no SQL answer (falls back to RAG). Remaining nuance:
+when a user can see only SOME rows of a table, the aggregate is over their
+visible subset — correct (no leak), but a "total" is a total of what they can
+see; answer framing for partial visibility is a future refinement.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.acl import resolve_user_groups
 from backend.generation.llm import decide_sql_route, sql_agent_step
 from backend.retrieval.table_catalog import retrieve_tables
 from backend.retrieval.tabular_sql import (
@@ -58,13 +63,20 @@ async def try_sql_answer(
     question: str,
     conversation_id: str | None = None,
     max_distance: float = DEFAULT_MAX_DISTANCE,
+    user_email: str | None = None,
 ) -> dict[str, Any] | None:
     """Attempt an exact SQL answer for `question`. Returns a dict with
     {context, sources, sql, table_name, result} on success, or None to fall
-    back to normal retrieval."""
+    back to normal retrieval.
+
+    `user_email` enforces ACL: candidate tables are gated and the rebuilt table
+    is filtered to the user's visible rows, so a SQL aggregate can never expose
+    data the user couldn't retrieve normally."""
+    user_groups = await resolve_user_groups(session, user_email) if user_email else []
     candidates = await retrieve_tables(
         session, question, conversation_id=conversation_id,
         top_k=CANDIDATE_TOP_K, max_distance=max_distance,
+        user_email=user_email, user_groups=user_groups,
     )
     if candidates:
         logger.info(
@@ -80,7 +92,10 @@ async def try_sql_answer(
         return None
 
     chosen = candidates[decision["table"] - 1]
-    tables = await load_tables(session, chosen["document_id"])
+    tables = await load_tables(
+        session, chosen["document_id"],
+        user_email=user_email, user_groups=user_groups,
+    )
     if not tables:
         # Catalog had it but row_data is missing (pre-Phase-1 doc not re-ingested).
         logger.info("sql_router: chosen doc %s not rebuildable -> rag", chosen["document_id"])

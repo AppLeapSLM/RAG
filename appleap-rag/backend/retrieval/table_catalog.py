@@ -19,10 +19,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.db.models import Document, TableCatalog
+from backend.acl import acl_filter_textclause
+from backend.db.models import Chunk, Document, TableCatalog
 from backend.embedding.embedder import embed_batch, embed_text
 # Reuse the SAME table-naming as the SQL builder so a catalog entry's
 # table_name matches what load_tables() will produce at query time.
@@ -116,6 +117,8 @@ async def retrieve_tables(
     conversation_id: str | None = None,
     top_k: int = 5,
     max_distance: float | None = None,
+    user_email: str | None = None,
+    user_groups: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Top-K candidate tables for `query`, ranked by pgvector cosine distance,
     scoped to corpus tables + this conversation's attachment tables (never
@@ -124,6 +127,11 @@ async def retrieve_tables(
     `max_distance` (cosine distance, 0=identical .. 2=opposite) optionally drops
     weak matches, so when nothing relevant exists the SQL option isn't offered
     and the decision falls to plain retrieval.
+
+    ACL: when `user_email` is set, a table is only offered if the user can see
+    at least one of its document's chunks (same per-chunk ACL filter as
+    retrieval). This avoids surfacing a restricted table's existence/columns to
+    the router; load_tables then enforces it at the row level too.
     """
     q_emb = await embed_text(query)
 
@@ -143,9 +151,15 @@ async def retrieve_tables(
         select(TableCatalog, distance)
         .join(Document, TableCatalog.document_id == Document.id)
         .where(scope)
-        .order_by(distance)
-        .limit(top_k)
     )
+    if user_email:
+        visible = (
+            exists()
+            .where(Chunk.document_id == TableCatalog.document_id)
+            .where(acl_filter_textclause(user_email, user_groups or [], chunk_table="chunks"))
+        )
+        stmt = stmt.where(visible)
+    stmt = stmt.order_by(distance).limit(top_k)
     rows = (await session.execute(stmt)).all()
 
     out: list[dict[str, Any]] = []

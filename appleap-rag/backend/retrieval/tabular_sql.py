@@ -37,6 +37,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.acl import acl_filter_textclause
 from backend.db.models import Chunk, Document
 
 logger = logging.getLogger(__name__)
@@ -235,12 +236,22 @@ def validate_select(sql: str) -> str:
 
 
 async def load_tables(
-    session: AsyncSession, document_id: str
+    session: AsyncSession,
+    document_id: str,
+    user_email: str | None = None,
+    user_groups: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Rebuild a document's table(s) from its persisted chunks. Returns a list
     of table specs (one per Excel sheet, or one for a CSV/TSV). Empty list if
     the document isn't tabular or predates Phase 1 (no row_data) — the caller
-    then falls back to normal retrieval."""
+    then falls back to normal retrieval.
+
+    ACL: when `user_email` is set, the SAME per-chunk ACL filter as normal
+    retrieval is applied, so the rebuilt table contains ONLY rows the user may
+    see and aggregates are correctly scoped to their access. Each row is a
+    chunk, so this enforces row-level permissions for free. A user with no
+    visible rows gets an empty table → the caller falls back to RAG, never
+    leaking restricted data through a SQL aggregate."""
     doc = await session.get(Document, document_id)
     if doc is None:
         return []
@@ -248,11 +259,12 @@ async def load_tables(
     schema = (doc.metadata_ or {}).get("table_schema") or {}
     schema_entries = schema.get("tables") or []
 
-    res = await session.execute(
-        select(Chunk)
-        .where(Chunk.document_id == document_id)
-        .order_by(Chunk.chunk_index)
-    )
+    stmt = select(Chunk).where(Chunk.document_id == document_id)
+    if user_email:
+        stmt = stmt.where(
+            acl_filter_textclause(user_email, user_groups or [], chunk_table="chunks")
+        )
+    res = await session.execute(stmt.order_by(Chunk.chunk_index))
     rows_by_sheet: dict[Any, list[dict]] = {}
     for ch in res.scalars().all():
         md = ch.metadata_ or {}
