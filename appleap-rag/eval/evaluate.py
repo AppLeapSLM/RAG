@@ -59,9 +59,10 @@ def load_conversations(path: Path) -> list[dict]:
 def _sse_query(client, api_url: str, payload: dict):
     """POST /query and consume the Server-Sent Events stream (the endpoint
     streams, it no longer returns JSON). Returns (answer, sources,
-    conversation_id): a 'start' event carries sources + conversation_id, 'delta'
-    events carry text, and an 'error' event raises."""
-    answer, sources, conv_id = "", [], None
+    conversation_id, route): the 'start' event carries sources +
+    conversation_id + route ('rag'|'sql'|'clarify'), 'delta' events carry
+    text, and an 'error' event raises."""
+    answer, sources, conv_id, route = "", [], None, "rag"
     with client.stream("POST", f"{api_url}/query", json=payload, timeout=300.0) as r:
         r.raise_for_status()
         for line in r.iter_lines():
@@ -77,11 +78,13 @@ def _sse_query(client, api_url: str, payload: dict):
                 sources = ev["sources"]
             if ev.get("conversation_id"):
                 conv_id = ev["conversation_id"]
+            if ev.get("route"):
+                route = ev["route"]
             if "text" in ev:
                 answer += ev["text"]
             if ev.get("error"):
                 raise RuntimeError(ev["error"])
-    return answer, sources, conv_id
+    return answer, sources, conv_id, route
 
 
 def is_refusal_response(answer: str) -> bool:
@@ -124,6 +127,28 @@ def score_retrieval(expected_sources: list[str], retrieved: list[dict]) -> tuple
     return recall, mrr, hit
 
 
+def _norm_for_match(text: str) -> str:
+    """Lowercase + strip commas so "12,532" matches "12532"."""
+    return text.lower().replace(",", "")
+
+
+def score_sql_answer(expected_values: list[str], answer: str) -> tuple[float, float, int]:
+    """Score a SQL-routed answer on correctness, not retrieval. A question
+    answered by the DuckDB path returns a table citation (not the expected
+    chunks), so recall is meaningless — instead check that every discriminating
+    value from the ground truth appears in the answer text.
+
+    Returns (recall-like fraction of values found, mrr-proxy, hit).
+    """
+    if not expected_values:
+        return 0.0, 0.0, 0  # SQL-routed but no ground-truth values authored
+    norm = _norm_for_match(answer)
+    found = sum(1 for v in expected_values if _norm_for_match(str(v)) in norm)
+    frac = found / len(expected_values)
+    hit = 1 if found == len(expected_values) else 0
+    return frac, float(hit), hit
+
+
 def evaluate_retrieval(
     client: httpx.Client,
     api_url: str,
@@ -138,6 +163,7 @@ def evaluate_retrieval(
         "mrr_sum": 0.0,
         "hits": 0,
         "by_category": {},
+        "route_dist": {"rag": 0, "sql": 0, "clarify": 0},
         "details": [],
     }
 
@@ -155,7 +181,7 @@ def evaluate_retrieval(
         cat["total"] += 1
 
         try:
-            answer, sources, _ = _sse_query(
+            answer, sources, _, route = _sse_query(
                 client, api_url, {"question": question, "top_k": top_k}
             )
         except Exception as e:
@@ -163,10 +189,22 @@ def evaluate_retrieval(
             results["details"].append({"id": qid, "question": question, "error": str(e)})
             continue
 
-        # Refusal questions are scored on the answer pattern, not retrieval
+        results["route_dist"][route] = results["route_dist"].get(route, 0) + 1
+        expected_values = q.get("expected_values", [])
+
+        # Score by how the answer was actually produced.
         if category == "refusal":
+            # refusal: scored on the answer pattern, not retrieval
             refused = is_refusal_response(answer)
             recall, mrr, hit = (1.0, 1.0, 1) if refused else (0.0, 0.0, 0)
+        elif route == "clarify":
+            # The system asked a clarifying question instead of answering.
+            # No retrieval happened → a miss for a question we expected it to
+            # answer. Surfaced distinctly in the report (not a retrieval bug).
+            recall, mrr, hit = 0.0, 0.0, 0
+        elif route == "sql":
+            # Answered via the DuckDB path → score on answer correctness.
+            recall, mrr, hit = score_sql_answer(expected_values, answer)
         else:
             recall, mrr, hit = score_retrieval(expected_sources, sources)
 
@@ -182,29 +220,43 @@ def evaluate_retrieval(
             "question": question,
             "category": category,
             "difficulty": q.get("difficulty", "unknown"),
+            "route": route,
             "recall": recall,
             "mrr": mrr,
             "hit": bool(hit),
             "expected_sources": expected_sources,
             "answer_preview": answer[:200],
         }
-        if category != "refusal":
+        if category == "refusal":
+            detail["refused"] = is_refusal_response(answer)
+        elif route == "clarify":
+            detail["clarified"] = True
+            detail["clarification"] = answer[:200]
+        elif route == "sql":
+            detail["expected_values"] = expected_values
+            detail["values_found"] = [
+                v for v in expected_values
+                if _norm_for_match(str(v)) in _norm_for_match(answer)
+            ]
+        else:
             detail["found_sources"] = [
                 e for e in expected_sources
                 if any(source_matches(e, s.get("content_preview", "")) for s in sources)
             ]
-        else:
-            detail["refused"] = is_refusal_response(answer)
         results["details"].append(detail)
 
         if verbose:
             status = "HIT" if hit else "MISS"
-            print(f"  [{qid}] {status} | Recall={recall:.2f} | MRR={mrr:.2f} | {question[:60]}")
-            if not hit and category != "refusal":
-                print(f"         Expected: {expected_sources}")
-                print(f"         Got previews: {[s.get('content_preview', '')[:50] for s in sources[:3]]}")
+            print(f"  [{qid}] {status} | route={route} | Recall={recall:.2f} | MRR={mrr:.2f} | {question[:55]}")
+            if not hit and route == "clarify":
+                print(f"         Clarified instead of answering: {answer[:110]}")
+            elif not hit and route == "sql":
+                print(f"         SQL answer missing values {expected_values}; got: {answer[:110]}")
             elif not hit and category == "refusal":
                 print(f"         Expected refusal, got: {answer[:120]}")
+            elif not hit:
+                print(f"         Expected: {expected_sources}")
+                print(f"         Got previews: {[s.get('content_preview', '')[:50] for s in sources[:3]]}")
 
     return results
 
@@ -254,7 +306,7 @@ def evaluate_conversations(
                 payload["conversation_id"] = conversation_id
 
             try:
-                answer, sources, conv_started = _sse_query(client, api_url, payload)
+                answer, sources, conv_started, route = _sse_query(client, api_url, payload)
             except Exception as e:
                 print(f"    [T{i}] ERROR: {e}")
                 trace_detail["turns"].append({"turn": i, "error": str(e)})
@@ -275,6 +327,7 @@ def evaluate_conversations(
             trace_detail["turns"].append({
                 "turn": i,
                 "question": question,
+                "route": route,
                 "expected_sources": expected_sources,
                 "recall": recall,
                 "mrr": mrr,
@@ -284,7 +337,7 @@ def evaluate_conversations(
 
             if verbose:
                 status = "HIT" if hit else "MISS"
-                print(f"    [T{i}] {status} | Recall={recall:.2f} | {question[:60]}")
+                print(f"    [T{i}] {status} | route={route} | Recall={recall:.2f} | {question[:55]}")
 
         results["trace_details"].append(trace_detail)
 
@@ -310,6 +363,9 @@ def print_report(results: dict, top_k: int):
     print(f"    MRR:         {mrr:.3f}")
     print(f"    Hit Rate:    {hit_rate:.3f}  ({results['hits']}/{total})")
 
+    rd = results.get("route_dist", {})
+    print(f"    Routes:      rag={rd.get('rag', 0)}  sql={rd.get('sql', 0)}  clarify={rd.get('clarify', 0)}")
+
     print(f"\n  By Category:")
     print(f"    {'Category':<20} {'Recall@K':>10} {'MRR':>10} {'Hit Rate':>10} {'Count':>8}")
     print(f"    {'-'*20} {'-'*10} {'-'*10} {'-'*10} {'-'*8}")
@@ -325,11 +381,18 @@ def print_report(results: dict, top_k: int):
 
     misses = [d for d in results["details"] if not d.get("hit", False) and "error" not in d]
     if misses:
-        print(f"\n  Missed Questions ({len(misses)}):")
+        clarified = [m for m in misses if m.get("route") == "clarify"]
+        suffix = f"; {len(clarified)} were CLARIFY, not retrieval misses" if clarified else ""
+        print(f"\n  Missed Questions ({len(misses)}{suffix}):")
         for m in misses:
-            print(f"    [{m['id']}] {m['question'][:70]}")
+            tag = f" [{m.get('route')}]" if m.get("route") and m.get("route") != "rag" else ""
+            print(f"    [{m['id']}]{tag} {m['question'][:65]}")
             if m["category"] == "refusal":
                 print(f"            Expected refusal; got non-refusal answer")
+            elif m.get("route") == "clarify":
+                print(f"            Clarified instead: {m.get('clarification', '')[:90]}")
+            elif m.get("route") == "sql":
+                print(f"            SQL found {m.get('values_found')} of {m.get('expected_values')}")
             else:
                 print(f"            Expected: {m['expected_sources']}")
 

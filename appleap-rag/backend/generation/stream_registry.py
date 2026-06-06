@@ -39,6 +39,7 @@ class StreamState:
     status: str = "streaming"  # 'streaming' | 'completed' | 'error'
     error_text: Optional[str] = None
     sources: list[dict] = field(default_factory=list)
+    route: str = "rag"  # how the answer was produced: 'rag' | 'sql' (clarify never registers)
     subscribers: list[asyncio.Queue] = field(default_factory=list)
     done_event: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -50,13 +51,19 @@ class StreamState:
 _active: dict[str, StreamState] = {}
 
 
-def register(message_id: str, conversation_id: str, sources: list[dict]) -> StreamState:
+def register(
+    message_id: str,
+    conversation_id: str,
+    sources: list[dict],
+    route: str = "rag",
+) -> StreamState:
     """Create + register a new StreamState. Called by /query before generation
     starts. Returns the state so the producer can push deltas to it."""
     state = StreamState(
         message_id=message_id,
         conversation_id=conversation_id,
         sources=sources,
+        route=route,
     )
     _active[message_id] = state
     return state

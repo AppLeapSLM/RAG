@@ -667,6 +667,7 @@
     "id": "AGG-01",
     "question": "From cmdb-production.csv, which services have status 'degraded' or 'maintenance'? List name, team, and owner_email for each.",
     "expected_answer": "degraded services (5 rows): api-gateway (backend-services, marcus.williams@novacrest.io), etl-worker (data-engineering, priya.patel@novacrest.io), canary-deployer (platform-engineering, sarah.chen@novacrest.io), postgres-alerts (platform-engineering, sarah.chen@novacrest.io), elasticsearch-audit (security-engineering, aisha.nakamura@novacrest.io). maintenance services (6 rows): schema-registry (data-engineering, priya.patel@novacrest.io), dead-letter-processor (sre, james.obrien@novacrest.io), postgres-audit (security-engineering, aisha.nakamura@novacrest.io), s3-data-lake (data-engineering, priya.patel@novacrest.io), s3-dlq-archive (sre, james.obrien@novacrest.io), jaeger (sre, james.obrien@novacrest.io). Total: 5 degraded + 6 maintenance = 11 non-operational rows.",
+    "expected_values": ["api-gateway", "etl-worker", "schema-registry", "jaeger"],
     "expected_sources": ["cmdb-production.csv"],
     "category": "aggregation",
     "difficulty": "medium"
@@ -683,6 +684,7 @@
     "id": "AGG-03",
     "question": "From cmdb-databases.csv, which postgres databases have a backup_retention_days value greater than 30? List each with its retention period.",
     "expected_answer": "Four postgres databases have backup_retention_days > 30: postgres-auth (35 days, authentication database encrypted at rest with KMS), postgres-tenants (35 days, tenant configuration and provisioning state), postgres-billing (90 days, financial audit requirements per description), postgres-audit (2555 days, ~7 years — description: 'Immutable audit log. 7-year retention for compliance. Append-only, no deletions allowed.'). The remaining postgres databases sit at 14-30 days.",
+    "expected_values": ["postgres-auth", "postgres-billing", "postgres-audit", "90", "2555"],
     "expected_sources": ["cmdb-databases.csv"],
     "category": "aggregation",
     "difficulty": "hard"

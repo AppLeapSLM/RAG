@@ -720,6 +720,7 @@ async def _stream_clarification(
         "conversation_id": conversation_id,
         "message_id": message_id,
         "sources": [],
+        "route": "clarify",
     })
     chunk_size = 4  # ~1 token's worth of characters
     delay = 0.025   # ~40 tok/s
@@ -768,6 +769,7 @@ async def _stream_fresh(
             "conversation_id": state.conversation_id,
             "message_id": state.message_id,
             "sources": state.sources,
+            "route": state.route,
         })
         # If anything was generated before subscribe (race-tolerant — usually
         # empty since we subscribe before the producer task gets to run),
@@ -896,7 +898,7 @@ async def query(
     try:
         candidates = await retrieve_tables(
             session, search_query, conversation_id=conv.id,
-            top_k=5, max_distance=0.6,
+            top_k=5, max_distance=0.45,
             user_email=user.email, user_groups=user_groups,
         )
     except Exception:
@@ -997,8 +999,13 @@ async def query(
 
     # 7. Register the stream + spawn background generation. The task is
     #    intentionally NOT tied to the request lifecycle — it survives
-    #    client disconnect so the answer always completes.
-    state = stream_registry.register(assistant_msg_id, conv.id, sources)
+    #    client disconnect so the answer always completes. `actual_route`
+    #    reflects how the answer is really produced: a "sql" decision that
+    #    fell back to RAG (sql_answer is None) is reported as "rag".
+    actual_route = "sql" if sql_answer is not None else "rag"
+    state = stream_registry.register(
+        assistant_msg_id, conv.id, sources, route=actual_route,
+    )
     asyncio.create_task(_run_generation(
         state=state,
         question=req.question,
