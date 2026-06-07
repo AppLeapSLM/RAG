@@ -307,6 +307,7 @@
     "id": "CMDB-01",
     "question": "What is the technology, port, and tier of the ingest-service in cmdb-production.csv, and which team owns it?",
     "expected_answer": "Technology: rust. Port: 8090. Tier: 1 (critical). Owned by data-engineering. Status: operational. Owner email: priya.patel@novacrest.io.",
+    "expected_values": ["rust", "8090", "data-engineering"],
     "expected_sources": ["cmdb-production.csv"],
     "category": "cmdb",
     "difficulty": "easy"
@@ -315,6 +316,7 @@
     "id": "CMDB-02",
     "question": "What is the criticality and team for the cert-manager-controller in the CMDB, and what is described as the #1 preventable outage cause?",
     "expected_answer": "Criticality: high. Team: security-engineering. The CMDB description for cert-manager-controller states cert expiry is the #1 preventable outage cause. The service auto-renews certificates from Let's Encrypt (external) and Vault PKI (internal). Owner: aisha.nakamura@novacrest.io.",
+    "expected_values": ["high", "security-engineering"],
     "expected_sources": ["cmdb-production.csv"],
     "category": "cmdb",
     "difficulty": "easy"
@@ -331,6 +333,7 @@
     "id": "CMDB-04",
     "question": "In cmdb-databases.csv, what is the storage size, instance class, multi-AZ setting, read replica count, max_connections, and backup_retention_days for postgres-billing?",
     "expected_answer": "postgres-billing: storage_gb=1000, instance_class=db.r6g.xlarge, multi_az=True, read_replicas=2, max_connections=150, backup_retention_days=90. Aurora engine, version 15.4.",
+    "expected_values": ["db.r6g.xlarge", "1000", "150", "90"],
     "expected_sources": ["cmdb-databases.csv"],
     "category": "cmdb",
     "difficulty": "medium"

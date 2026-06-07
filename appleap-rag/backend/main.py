@@ -876,11 +876,18 @@ async def query(
         logger.exception("retrieve_tables failed conv=%s", conv.id)
         candidates = []
 
-    # 3c. One grounded route decision: RAG vs SQL — informed by which tables (if
-    #     any) matched. Whether to answer / clarify / refuse is decided later by
-    #     the generation step, with the retrieved context in hand.
-    route_info = await decide_route(search_query, candidates)
-    route = route_info["route"]
+    # 3c. Route RAG vs SQL — informed by which tables (if any) matched. SQL is
+    #     only possible when a candidate table matched, so when none did (the
+    #     common case for non-tabular questions) skip the decide_route LLM call
+    #     entirely and go straight to RAG — saves a full Phi-4 forward pass on
+    #     the critical path. (Whether to answer / clarify / refuse is decided
+    #     later at generation, with the retrieved context in hand.)
+    if candidates:
+        route_info = await decide_route(search_query, candidates)
+        route = route_info["route"]
+    else:
+        route_info = {"route": "rag", "table": None, "reason": "no candidate tables"}
+        route = "rag"
     logger.info("query_route route=%s conv=%s", route, conv.id)
 
     # 4. SQL route — run the data query engine over the table the router chose,
