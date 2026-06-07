@@ -342,6 +342,7 @@
     "id": "CMDB-05",
     "question": "What is the storage, backup retention, instance class, and policy enforcement described for postgres-audit in cmdb-databases.csv, and what compliance need drives those settings?",
     "expected_answer": "postgres-audit (aurora 15.4): storage_gb=2000, instance_class=db.r6g.xlarge, max_connections=100, backup_retention_days=2555 (~7 years), multi_az=True, read_replicas=1. The description reads 'Immutable audit log. 7-year retention for compliance. Append-only, no deletions allowed.' Owner: aisha.nakamura@novacrest.io. The 7-year retention reflects regulatory compliance requirements for audit data.",
+    "expected_values": ["2000", "2555", "db.r6g.xlarge"],
     "expected_sources": ["cmdb-databases.csv"],
     "category": "cmdb",
     "difficulty": "hard"
