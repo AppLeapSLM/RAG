@@ -13,21 +13,48 @@ from backend.db.models import Chunk
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
-    "You are AppLeap, a technical support assistant for IT Operations. "
-    "Your primary directive is to provide perfectly accurate answers based "
-    "strictly on the internal company documents provided in the context.\n\n"
-    "RULES:\n"
-    "1. STRICT GROUNDING: Answer using ONLY information from the provided context. "
-    "Do not use your pre-trained knowledge to fill in gaps or speculate.\n"
-    "2. REFUSAL: If the context does not contain the information needed to answer "
-    'the query, output exactly: "I could not find this information in the '
-    'available documents."\n'
-    "3. CITATION: Every factual claim must cite its source using: "
-    "[Document: X | Section: Y].\n"
-    "4. CASUAL CONVERSATION: If the query is a greeting, farewell, or casual remark, "
-    "ignore the context and respond naturally as a helpful colleague.\n"
-    "5. FORMAT: Use Markdown (bold, code blocks, bullet points) for technical content. "
-    "Be concise and direct."
+    "You are AppLeap, a technical support assistant for IT Operations. For each "
+    "question you are given CONTEXT — excerpts from the company's internal "
+    "documents. Answer strictly from that context; being accurate and honest "
+    "about what it does and does not contain is your highest priority.\n\n"
+    "HOW TO RESPOND (follow in order):\n\n"
+    "STEP 1 — If the message is a greeting, farewell, or small talk rather than "
+    "a request for information, reply naturally as a helpful colleague and stop. "
+    "The rest does not apply.\n\n"
+    "STEP 2 — Otherwise read the CONTEXT and take EXACTLY ONE of these three "
+    "actions:\n\n"
+    "  [ANSWER] — the default; choose it whenever the context supports an "
+    "answer. Answer the question directly and completely, using only the "
+    "context.\n"
+    '    - A multi-part question ("compare A and B", "list X, Y, Z") is NOT '
+    "ambiguous — answer every part the context covers.\n"
+    "    - Combining facts across several chunks, or selecting the most relevant "
+    "of several documents, is normal answering — NOT a reason to clarify.\n\n"
+    "  [CLARIFY] — rare; only when you genuinely cannot answer without the user. "
+    "Use ONLY when the context supports two or more materially different answers "
+    "and nothing in the question indicates which the user means. Ask ONE short "
+    "question that names the options, then stop.\n"
+    "    - NEVER clarify when the context yields a clear answer.\n"
+    '    - NEVER ask the user which file to look in, or to "provide more '
+    'detail/context" about where to find information — locating it is your '
+    "job.\n\n"
+    "  [REFUSE] — when the answer is not in the context. Output exactly: "
+    '"I could not find this information in the available documents." Never guess '
+    "or fall back on prior knowledge.\n\n"
+    "OUTPUT RULES:\n"
+    "- GROUNDING: use ONLY the provided context; never add outside knowledge or "
+    "speculation.\n"
+    "- CITATION: support every factual claim with [Document: X | Section: Y], "
+    "citing only documents that appear in the context — never invent a "
+    "citation.\n"
+    "- FORMAT: use Markdown (bold, code blocks, bullet points) for technical "
+    "content; be concise and direct.\n\n"
+    "DECIDING THE HARD CASES (illustrations only):\n"
+    '- "Compare the CPU limits of auth-service and ingest-service." + context '
+    "has both -> ANSWER both (a multi-part question is not ambiguous).\n"
+    '- "What is the backup retention?" + context lists several services each '
+    "with a different value and the question names none -> CLARIFY (which "
+    "service?)."
 )
 
 REWRITE_PROMPT = (
@@ -162,17 +189,14 @@ ROUTE_PROMPT = (
     "average, min/max, total, 'how many', or filtering/grouping over many rows. "
     "The system finds the exact columns and values itself. Give the table number.\n"
     '- "rag": answer by searching the documents — prose/text, a single-fact '
-    "lookup, or when none of the listed tables hold the needed data.\n"
-    '- "clarify": ask the user ONE short question — ONLY as a last resort, when '
-    "no attempt could succeed without information that ONLY the user can give.\n\n"
+    "lookup, or when none of the listed tables hold the needed data.\n\n"
     "PRINCIPLES:\n"
-    "- Prefer acting (sql/rag) over asking; an attempt is cheap and recoverable.\n"
-    "- Use sql when the answer needs a calculation over many/all rows of a listed "
-    "table; use rag for prose or single-fact questions.\n"
-    "- Do NOT clarify about things the system can discover itself (which table, "
-    "column, or value) — that is what sql/rag do.\n"
-    '- Output ONLY this JSON object: {"route": "sql|rag|clarify", "table": '
-    '<number or null>, "clarification": <string or null>, "reason": "<short>"}'
+    "- Default to rag. Choose sql ONLY when the answer needs a calculation over "
+    "many/all rows of a listed table whose columns clearly contain the data.\n"
+    "- The downstream step answers, asks for clarification, or declines on its "
+    "own using the retrieved content — your only job here is rag vs sql.\n"
+    '- Output ONLY this JSON object: {"route": "sql|rag", "table": '
+    '<number or null>, "reason": "<short>"}'
 )
 
 SQL_AGENT_PROMPT = (
@@ -236,15 +260,14 @@ def _strip_sql(text: str) -> str:
 async def decide_route(
     question: str,
     candidates: list[dict],
-    prev_was_clarification: bool = False,
 ) -> dict:
-    """Grounded 3-way route decision, informed by the candidate tables. Returns
-    {"route": "sql"|"rag"|"clarify", "table": <1-based index|None>,
-    "clarification": <str|None>, "reason": <str>}.
+    """Grounded 2-way route decision, informed by the candidate tables. Returns
+    {"route": "sql"|"rag", "table": <1-based index|None>, "reason": <str>}.
 
     Safety: degrades to "rag" on any parse problem; a "sql" route needs a valid
-    table index or it falls to "rag"; and a "clarify" is suppressed if we already
-    clarified last turn (loop-breaker — the user can always escape by replying)."""
+    table index or it falls to "rag". Clarification is NOT decided here — the
+    generation step decides answer/clarify/refuse with the retrieved context in
+    hand (see SYSTEM_PROMPT), so a clear question is never blocked pre-retrieval."""
     if candidates:
         lines = []
         for i, c in enumerate(candidates, 1):
@@ -262,11 +285,7 @@ async def decide_route(
     data = _extract_json(raw) or {}
 
     route = str(data.get("route", "")).lower().strip()
-    if route not in ("sql", "rag", "clarify"):
-        route = "rag"
-
-    if route == "clarify" and prev_was_clarification:
-        logger.info("decide_route CLARIFY suppressed (prev turn was a clarification) — using rag")
+    if route not in ("sql", "rag"):
         route = "rag"
 
     table = data.get("table") if isinstance(data.get("table"), int) else None
@@ -274,12 +293,8 @@ async def decide_route(
         logger.info("decide_route sql without a valid table -> rag")
         route, table = "rag", None
 
-    clarification = str(data.get("clarification") or "") if route == "clarify" else None
-    if route == "clarify" and not clarification:
-        route = "rag"  # wanted to clarify but gave no question — attempt instead
-
     logger.info("decide_route route=%s table=%s reason=%s", route, table, str(data.get("reason", ""))[:120])
-    return {"route": route, "table": table, "clarification": clarification, "reason": str(data.get("reason", ""))}
+    return {"route": route, "table": table, "reason": str(data.get("reason", ""))}
 
 
 async def sql_agent_step(

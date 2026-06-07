@@ -59,10 +59,20 @@ def load_conversations(path: Path) -> list[dict]:
 def _sse_query(client, api_url: str, payload: dict):
     """POST /query and consume the Server-Sent Events stream (the endpoint
     streams, it no longer returns JSON). Returns (answer, sources,
-    conversation_id, route): the 'start' event carries sources +
-    conversation_id + route ('rag'|'sql'|'clarify'), 'delta' events carry
-    text, and an 'error' event raises."""
+    conversation_id, route, timing): the 'start' event carries sources +
+    conversation_id + route ('rag'|'sql'), 'delta' events carry text, and an
+    'error' event raises.
+
+    `timing` is a dict of wall-clock seconds from request send:
+      t_start — to the 'start' event (retrieval + rewrite + route, + SQL agent
+                if routed sql): the pre-generation overhead.
+      ttft    — to the first 'delta' (first generated token): time-to-first-token.
+      total   — to stream close (full answer generated).
+    """
     answer, sources, conv_id, route = "", [], None, "rag"
+    t0 = time.monotonic()
+    t_start = None
+    ttft = None
     with client.stream("POST", f"{api_url}/query", json=payload, timeout=300.0) as r:
         r.raise_for_status()
         for line in r.iter_lines():
@@ -76,15 +86,20 @@ def _sse_query(client, api_url: str, payload: dict):
                 continue
             if "sources" in ev:
                 sources = ev["sources"]
+                if t_start is None:
+                    t_start = time.monotonic() - t0
             if ev.get("conversation_id"):
                 conv_id = ev["conversation_id"]
             if ev.get("route"):
                 route = ev["route"]
             if "text" in ev:
+                if ttft is None:
+                    ttft = time.monotonic() - t0
                 answer += ev["text"]
             if ev.get("error"):
                 raise RuntimeError(ev["error"])
-    return answer, sources, conv_id, route
+    timing = {"t_start": t_start, "ttft": ttft, "total": time.monotonic() - t0}
+    return answer, sources, conv_id, route, timing
 
 
 def is_refusal_response(answer: str) -> bool:
@@ -132,6 +147,29 @@ def _norm_for_match(text: str) -> str:
     return text.lower().replace(",", "")
 
 
+def _pct(values: list[float], p: float) -> float:
+    """Nearest-rank percentile (p in 0..100) of a list. Empty -> 0.0."""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    k = max(0, min(len(s) - 1, int(round((p / 100.0) * (len(s) - 1)))))
+    return s[k]
+
+
+def latency_stats(timings: list[dict], key: str) -> dict:
+    """Aggregate one timing field (e.g. 'ttft') across questions."""
+    vals = [t[key] for t in timings if t and t.get(key) is not None]
+    if not vals:
+        return {"n": 0}
+    return {
+        "n": len(vals),
+        "mean": sum(vals) / len(vals),
+        "median": _pct(vals, 50),
+        "p90": _pct(vals, 90),
+        "max": max(vals),
+    }
+
+
 def score_sql_answer(expected_values: list[str], answer: str) -> tuple[float, float, int]:
     """Score a SQL-routed answer on correctness, not retrieval. A question
     answered by the DuckDB path returns a table citation (not the expected
@@ -164,6 +202,7 @@ def evaluate_retrieval(
         "hits": 0,
         "by_category": {},
         "route_dist": {"rag": 0, "sql": 0, "clarify": 0},
+        "timings": [],
         "details": [],
     }
 
@@ -181,7 +220,7 @@ def evaluate_retrieval(
         cat["total"] += 1
 
         try:
-            answer, sources, _, route = _sse_query(
+            answer, sources, _, route, timing = _sse_query(
                 client, api_url, {"question": question, "top_k": top_k}
             )
         except Exception as e:
@@ -190,6 +229,7 @@ def evaluate_retrieval(
             continue
 
         results["route_dist"][route] = results["route_dist"].get(route, 0) + 1
+        results["timings"].append(timing)
         expected_values = q.get("expected_values", [])
 
         # Score by how the answer was actually produced.
@@ -224,6 +264,7 @@ def evaluate_retrieval(
             "recall": recall,
             "mrr": mrr,
             "hit": bool(hit),
+            "timing": timing,
             "expected_sources": expected_sources,
             "answer_preview": answer[:200],
         }
@@ -306,7 +347,7 @@ def evaluate_conversations(
                 payload["conversation_id"] = conversation_id
 
             try:
-                answer, sources, conv_started, route = _sse_query(client, api_url, payload)
+                answer, sources, conv_started, route, timing = _sse_query(client, api_url, payload)
             except Exception as e:
                 print(f"    [T{i}] ERROR: {e}")
                 trace_detail["turns"].append({"turn": i, "error": str(e)})
@@ -332,6 +373,7 @@ def evaluate_conversations(
                 "recall": recall,
                 "mrr": mrr,
                 "hit": bool(hit),
+                "timing": timing,
                 "answer_preview": (answer or "")[:140],
             })
 
@@ -365,6 +407,21 @@ def print_report(results: dict, top_k: int):
 
     rd = results.get("route_dist", {})
     print(f"    Routes:      rag={rd.get('rag', 0)}  sql={rd.get('sql', 0)}  clarify={rd.get('clarify', 0)}")
+
+    det = [d for d in results["details"] if d.get("timing")]
+    if det:
+        all_t = [d["timing"] for d in det]
+        tt = latency_stats(all_t, "ttft")
+        ts = latency_stats(all_t, "t_start")
+        tot = latency_stats(all_t, "total")
+        print(f"\n  Latency (seconds):")
+        print(f"    TTFT       mean {tt['mean']:.1f}  median {tt['median']:.1f}  p90 {tt['p90']:.1f}  max {tt['max']:.1f}")
+        print(f"    pre-gen    mean {ts['mean']:.1f}  median {ts['median']:.1f}  p90 {ts['p90']:.1f}   (to 'start' event: retrieval+rewrite+route+sql)")
+        print(f"    total      mean {tot['mean']:.1f}  median {tot['median']:.1f}  p90 {tot['p90']:.1f}")
+        for rt in ("rag", "sql"):
+            rtt = latency_stats([d["timing"] for d in det if d.get("route") == rt], "ttft")
+            if rtt.get("n"):
+                print(f"    TTFT[{rt}]   mean {rtt['mean']:.1f}  median {rtt['median']:.1f}  n={rtt['n']}")
 
     print(f"\n  By Category:")
     print(f"    {'Category':<20} {'Recall@K':>10} {'MRR':>10} {'Hit Rate':>10} {'Count':>8}")

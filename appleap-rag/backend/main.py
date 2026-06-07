@@ -707,29 +707,6 @@ async def _run_generation(
         stream_registry.remove(state.message_id)
 
 
-async def _stream_clarification(
-    conversation_id: str,
-    message_id: str,
-    text: str,
-) -> AsyncIterator[str]:
-    """SSE generator for a clarifying question. The text was produced by the
-    rewrite call and is already complete — we pace delivery at ~Phi-4's
-    native rate (~40 tok/s) so the UX is indistinguishable from a real
-    generation stream."""
-    yield _sse("start", {
-        "conversation_id": conversation_id,
-        "message_id": message_id,
-        "sources": [],
-        "route": "clarify",
-    })
-    chunk_size = 4  # ~1 token's worth of characters
-    delay = 0.025   # ~40 tok/s
-    for i in range(0, len(text), chunk_size):
-        yield _sse("delta", {"text": text[i:i + chunk_size]})
-        await asyncio.sleep(delay)
-    yield _sse("done", {})
-
-
 async def _stream_existing(state: stream_registry.StreamState) -> AsyncIterator[str]:
     """SSE generator that resumes an in-flight stream. Sends a snapshot of
     accumulated text first, then drains new deltas until done/error."""
@@ -838,12 +815,6 @@ async def query(
         )
     ).scalars().all()
     history = [{"role": m.role, "content": m.content} for m in rows]
-    # Loop-breaker for the rewriter: if our last reply was a clarification, the
-    # user is answering it — don't clarify again, attempt the query instead.
-    _last_assistant = next((m for m in reversed(rows) if m.role == "assistant"), None)
-    prev_was_clarification = bool(
-        _last_assistant and (_last_assistant.metadata_ or {}).get("clarification")
-    )
 
     # 2b. Load inline attachments for this conversation (prepended to context).
     inline_rows = (
@@ -905,33 +876,12 @@ async def query(
         logger.exception("retrieve_tables failed conv=%s", conv.id)
         candidates = []
 
-    # 3c. One grounded route decision: CLARIFY / RAG / SQL — informed by which
-    #     tables (if any) matched.
-    route_info = await decide_route(
-        search_query, candidates, prev_was_clarification=prev_was_clarification,
-    )
+    # 3c. One grounded route decision: RAG vs SQL — informed by which tables (if
+    #     any) matched. Whether to answer / clarify / refuse is decided later by
+    #     the generation step, with the retrieved context in hand.
+    route_info = await decide_route(search_query, candidates)
     route = route_info["route"]
     logger.info("query_route route=%s conv=%s", route, conv.id)
-
-    if route == "clarify":
-        # No retrieval/generation: persist the clarification and fake-stream it.
-        clarification = route_info.get("clarification") or "Could you clarify your question?"
-        assistant_msg_id = str(uuid.uuid4())
-        session.add(Message(conversation_id=conv.id, role="user", content=req.question))
-        session.add(Message(
-            id=assistant_msg_id, conversation_id=conv.id, role="assistant",
-            content=clarification, status="completed", model_used=settings.llm_model,
-            sources=[], metadata_={"clarification": True},
-        ))
-        if conv.title == "New Chat":
-            conv.title = req.question[:100]
-        conv.updated_at = datetime.now(timezone.utc)
-        await session.commit()
-        return StreamingResponse(
-            _stream_clarification(conv.id, assistant_msg_id, clarification),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
-        )
 
     # 4. SQL route — run the data query engine over the table the router chose,
     #    reusing the candidates we already retrieved. Any failure falls back to
