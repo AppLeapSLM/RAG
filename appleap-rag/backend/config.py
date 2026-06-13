@@ -29,9 +29,36 @@ class Settings(BaseSettings):
     admin_token: str = ""
 
     # Retrieval
-    top_k: int = 5
+    top_k: int = 5  # DEPRECATED for RAG selection — superseded by dynamic
+                    # rerank selection below. Still the request-model default;
+                    # no longer slices the reranked pool.
     neighbor_window: int = 0  # pull ±N adjacent chunks (0 = disabled)
     max_context_chars: int = 40000  # ~10K tokens hard cap sent to LLM
+
+    # Dynamic rerank selection (relative-to-top band). Instead of a fixed
+    # top_k slice, keep every chunk whose cross-encoder score is within
+    # `rerank_relative_delta` (logit space) of the top-scoring chunk, bounded
+    # to [rerank_floor, rerank_max_k]. This lets an enumeration question that
+    # has many near-equally-relevant docs keep them all, while a precise
+    # single-answer question keeps a tight set.
+    #   - floor = 5 == the old fixed top_k, so the selected set is always a
+    #     superset of the old top-5 → recall can only stay equal or improve
+    #     (no regression on the existing baseline).
+    #   - max_k caps over-fetch; max_context_chars (above) is the downstream
+    #     physical guard during context assembly.
+    #   - delta is in LOGIT units (the reranker's sigmoid output is inverted to
+    #     logits before banding — see reranker._to_logit). Tuned on the eval:
+    #     1.5 keeps precise single-answer questions tight at the floor (an exact
+    #     match sits ~6+ logits above near-duplicates) while still capturing
+    #     genuine enumeration clusters (e.g. 8 near-equal incident docs).
+    rerank_floor: int = 5
+    rerank_max_k: int = 15  # cap on the band. Bounds the latency/over-fetch tail
+                            # on near-duplicate-heavy queries (where widening is
+                            # mostly wasted). Verified: covers ENUM gold within
+                            # rank 15 except ENUM-04's 12th doc (tie-break at 18
+                            # → 11/12); CROSS-02 safe. Raise to 18 to keep ENUM-04
+                            # whole if the latency tail is acceptable.
+    rerank_relative_delta: float = 1.5
 
     # Embedding dimension (Nomic produces 768-dim vectors)
     embedding_dim: int = 768

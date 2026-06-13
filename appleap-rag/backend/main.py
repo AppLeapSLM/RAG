@@ -915,7 +915,6 @@ async def query(
         results = await search(
             search_query,
             session,
-            top_k=req.top_k,
             conversation_id=conv.id,
             user_email=user.email,
         )

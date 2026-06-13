@@ -692,5 +692,108 @@
     "expected_sources": ["cmdb-databases.csv"],
     "category": "aggregation",
     "difficulty": "hard"
+  },
+  {
+    "id": "ENUM-01",
+    "question": "List every NovaCrest incident where a Redis cluster failover caused session loss.",
+    "expected_answer": "Eight incidents, all of the 'redis-cluster-failover-causing-session-loss' type: INC-2022-004, INC-2023-020, INC-2023-029, INC-2024-035, INC-2024-046, INC-2025-062, INC-2025-068, INC-2026-092.",
+    "expected_sources": [
+      "INC-2022-004-redis-cluster-failover-causing-session-loss.md",
+      "INC-2023-020-redis-cluster-failover-causing-session-loss.md",
+      "INC-2023-029-redis-cluster-failover-causing-session-loss.md",
+      "INC-2024-035-redis-cluster-failover-causing-session-loss.md",
+      "INC-2024-046-redis-cluster-failover-causing-session-loss.md",
+      "INC-2025-062-redis-cluster-failover-causing-session-loss.md",
+      "INC-2025-068-redis-cluster-failover-causing-session-loss.md",
+      "INC-2026-092-redis-cluster-failover-causing-session-loss.md"
+    ],
+    "category": "enumeration",
+    "difficulty": "medium"
+  },
+  {
+    "id": "ENUM-02",
+    "question": "Which incidents were PostgreSQL connection-pool exhaustion events, and on which Postgres instance did each occur?",
+    "expected_answer": "Seven incidents: INC-2022-010 (postgres-auth), INC-2023-024 (postgres-alerts), INC-2024-032 (postgres-alerts), INC-2025-063 (postgres-alerts), INC-2025-064 (postgres-billing), INC-2026-098 (postgres-tenants), INC-2026-099 (postgres-auth).",
+    "expected_sources": [
+      "INC-2022-010-postgresql-connection-exhaustion-on-postgres-auth.md",
+      "INC-2023-024-postgresql-connection-exhaustion-on-postgres-alerts.md",
+      "INC-2024-032-postgresql-connection-exhaustion-on-postgres-alerts.md",
+      "INC-2025-063-postgresql-connection-exhaustion-on-postgres-alerts.md",
+      "INC-2025-064-postgresql-connection-exhaustion-on-postgres-billing.md",
+      "INC-2026-098-postgresql-connection-exhaustion-on-postgres-tenants.md",
+      "INC-2026-099-postgresql-connection-exhaustion-on-postgres-auth.md"
+    ],
+    "category": "enumeration",
+    "difficulty": "medium"
+  },
+  {
+    "id": "ENUM-03",
+    "question": "List all incidents caused by a TLS certificate expiry, and the component affected in each.",
+    "expected_answer": "Six incidents: INC-2022-002 (etl-worker), INC-2022-005 (search-service), INC-2024-031 (dead-letter-processor), INC-2024-051 (schema-registry), INC-2025-076 (session-store), INC-2026-090 (schema-registry).",
+    "expected_sources": [
+      "INC-2022-002-tls-certificate-expiry-on-etl-worker.md",
+      "INC-2022-005-tls-certificate-expiry-on-search-service.md",
+      "INC-2024-031-tls-certificate-expiry-on-dead-letter-processor.md",
+      "INC-2024-051-tls-certificate-expiry-on-schema-registry.md",
+      "INC-2025-076-tls-certificate-expiry-on-session-store.md",
+      "INC-2026-090-tls-certificate-expiry-on-schema-registry.md"
+    ],
+    "category": "enumeration",
+    "difficulty": "medium"
+  },
+  {
+    "id": "ENUM-04",
+    "question": "What canary deployment playbooks does NovaCrest have? List them.",
+    "expected_answer": "Twelve canary deployment playbooks, one per service: alert-engine, api-gateway, auth-service, billing-service, dashboard-service, edge-proxy, etl-worker, ingest-service, ml-inference, query-engine, schema-registry, tenant-manager.",
+    "expected_sources": [
+      "deployment-canary-alert-engine.md",
+      "deployment-canary-api-gateway.md",
+      "deployment-canary-auth-service.md",
+      "deployment-canary-billing-service.md",
+      "deployment-canary-dashboard-service.md",
+      "deployment-canary-edge-proxy.md",
+      "deployment-canary-etl-worker.md",
+      "deployment-canary-ingest-service.md",
+      "deployment-canary-ml-inference.md",
+      "deployment-canary-query-engine.md",
+      "deployment-canary-schema-registry.md",
+      "deployment-canary-tenant-manager.md"
+    ],
+    "category": "enumeration",
+    "difficulty": "medium"
+  },
+  {
+    "id": "ENUM-05",
+    "question": "List all of NovaCrest's capacity-planning playbooks.",
+    "expected_answer": "Six capacity-planning playbooks: ClickHouse storage, Elasticsearch storage, Kafka cluster scaling, Kubernetes node-pool scaling, PostgreSQL connection-pool scaling, and Redis memory capacity planning.",
+    "expected_sources": [
+      "capacity-clickhouse-storage-capacity-planning.md",
+      "capacity-elasticsearch-storage-capacity-planning.md",
+      "capacity-kafka-cluster-scaling-procedure.md",
+      "capacity-kubernetes-node-pool-scaling.md",
+      "capacity-postgresql-connection-pool-scaling.md",
+      "capacity-redis-memory-capacity-planning.md"
+    ],
+    "category": "enumeration",
+    "difficulty": "medium"
+  },
+  {
+    "id": "ENUM-06",
+    "question": "How does NovaCrest use HashiCorp Vault across the platform — its secrets-management approach, the PKI/mTLS decision, the unseal procedure, how services renew Vault tokens, and the recurring Vault-token-renewal incidents?",
+    "expected_answer": "Core Vault docs: the secrets-management-with-Vault security policy; ADR-011 (Vault PKI for internal mTLS vs a custom CA); the Vault unseal procedure (3-of-5 Shamir); the auth-service and config-service Vault-token runbooks. Plus the recurring Vault-token-renewal race-condition incidents in cron-dispatcher (INC-2022-012), metrics-aggregator (INC-2024-040), tenant-manager (INC-2025-076), dashboard-service (INC-2025-079), and image-processor (INC-2026-089). This is a graded-relevance discriminator question: the five conceptual docs score high, the five incidents score lower.",
+    "expected_sources": [
+      "security-security-policy-secrets-management-with-vault.md",
+      "adr-adr-011-vault-pki-for-internal-mtls-vs-custom-ca.md",
+      "security-vault-unseal-procedure.md",
+      "auth-service-vault-token-troubleshooting.md",
+      "config-service-vault-token-renewal.md",
+      "INC-2022-012-vault-token-renewal-race-condition-in-cron-dispatcher.md",
+      "INC-2024-040-vault-token-renewal-race-condition-in-metrics-aggregator.md",
+      "INC-2025-076-vault-token-renewal-race-condition-in-tenant-manager.md",
+      "INC-2025-079-vault-token-renewal-race-condition-in-dashboard-service.md",
+      "INC-2026-089-vault-token-renewal-race-condition-in-image-processor.md"
+    ],
+    "category": "enumeration",
+    "difficulty": "hard"
   }
 ]

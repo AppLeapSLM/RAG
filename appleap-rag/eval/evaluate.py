@@ -56,7 +56,7 @@ def load_conversations(path: Path) -> list[dict]:
         return json.load(f)
 
 
-def _sse_query(client, api_url: str, payload: dict):
+def _sse_query(client, api_url: str, payload: dict, sources_only: bool = False):
     """POST /query and consume the Server-Sent Events stream (the endpoint
     streams, it no longer returns JSON). Returns (answer, sources,
     conversation_id, route, timing): the 'start' event carries sources +
@@ -92,6 +92,14 @@ def _sse_query(client, api_url: str, payload: dict):
                 conv_id = ev["conversation_id"]
             if ev.get("route"):
                 route = ev["route"]
+            # Retrieval recall is scored purely from `sources` (delivered in the
+            # 'start' event, before generation). For retrieval-only subsets,
+            # abort once sources + route are in hand to skip the ~25-40s of
+            # Phi-4 generation. NOT safe for refusal/sql questions (they score
+            # on answer text) — the caller gates this.
+            if sources_only and sources and route:
+                t_start = t_start if t_start is not None else time.monotonic() - t0
+                break
             if "text" in ev:
                 if ttft is None:
                     ttft = time.monotonic() - t0
@@ -160,7 +168,7 @@ def latency_stats(timings: list[dict], key: str) -> dict:
     """Aggregate one timing field (e.g. 'ttft') across questions."""
     vals = [t[key] for t in timings if t and t.get(key) is not None]
     if not vals:
-        return {"n": 0}
+        return {"n": 0, "mean": 0.0, "median": 0.0, "p90": 0.0, "max": 0.0}
     return {
         "n": len(vals),
         "mean": sum(vals) / len(vals),
@@ -193,6 +201,7 @@ def evaluate_retrieval(
     questions: list[dict],
     top_k: int,
     verbose: bool,
+    sources_only: bool = False,
 ) -> dict:
     """Run all single-turn questions and compute per-category metrics."""
     results = {
@@ -221,7 +230,8 @@ def evaluate_retrieval(
 
         try:
             answer, sources, _, route, timing = _sse_query(
-                client, api_url, {"question": question, "top_k": top_k}
+                client, api_url, {"question": question, "top_k": top_k},
+                sources_only=sources_only and category != "refusal",
             )
         except Exception as e:
             print(f"  [{qid}] ERROR: {e}")
@@ -264,6 +274,7 @@ def evaluate_retrieval(
             "recall": recall,
             "mrr": mrr,
             "hit": bool(hit),
+            "n_sources": len(sources),
             "timing": timing,
             "expected_sources": expected_sources,
             "answer_preview": answer[:200],
@@ -398,12 +409,19 @@ def print_report(results: dict, top_k: int):
     hit_rate = results["hits"] / total
 
     print(f"\n{'=' * 70}")
-    print(f"  SINGLE-TURN EVALUATION (top_k={top_k}, {total} questions)")
+    print(f"  SINGLE-TURN EVALUATION (dynamic top-k, {total} questions)")
     print(f"{'=' * 70}")
     print(f"\n  Overall Metrics:")
-    print(f"    Recall@{top_k}:  {recall_at_k:.3f}  ({results['recall_sum']:.1f}/{total})")
+    print(f"    Recall:      {recall_at_k:.3f}  ({results['recall_sum']:.1f}/{total})")
     print(f"    MRR:         {mrr:.3f}")
     print(f"    Hit Rate:    {hit_rate:.3f}  ({results['hits']}/{total})")
+
+    # Dynamic top-k now returns a variable number of chunks per question.
+    # Surface the distribution so we can see the band widening on enumeration
+    # questions and watch for over-fetch on precise ones.
+    ns = [d["n_sources"] for d in results["details"] if d.get("n_sources") is not None]
+    if ns:
+        print(f"    Chunks kept: mean {sum(ns) / len(ns):.1f}  median {_pct([float(x) for x in ns], 50):.0f}  max {max(ns)}  min {min(ns)}")
 
     rd = results.get("route_dist", {})
     print(f"    Routes:      rag={rd.get('rag', 0)}  sql={rd.get('sql', 0)}  clarify={rd.get('clarify', 0)}")
@@ -415,9 +433,12 @@ def print_report(results: dict, top_k: int):
         ts = latency_stats(all_t, "t_start")
         tot = latency_stats(all_t, "total")
         print(f"\n  Latency (seconds):")
-        print(f"    TTFT       mean {tt['mean']:.1f}  median {tt['median']:.1f}  p90 {tt['p90']:.1f}  max {tt['max']:.1f}")
-        print(f"    pre-gen    mean {ts['mean']:.1f}  median {ts['median']:.1f}  p90 {ts['p90']:.1f}   (to 'start' event: retrieval+rewrite+route+sql)")
-        print(f"    total      mean {tot['mean']:.1f}  median {tot['median']:.1f}  p90 {tot['p90']:.1f}")
+        if tt["n"]:
+            print(f"    TTFT       mean {tt['mean']:.1f}  median {tt['median']:.1f}  p90 {tt['p90']:.1f}  max {tt['max']:.1f}")
+        if ts["n"]:
+            print(f"    pre-gen    mean {ts['mean']:.1f}  median {ts['median']:.1f}  p90 {ts['p90']:.1f}   (to 'start' event: retrieval+rewrite+route+sql)")
+        if tot["n"]:
+            print(f"    total      mean {tot['mean']:.1f}  median {tot['median']:.1f}  p90 {tot['p90']:.1f}")
         for rt in ("rag", "sql"):
             rtt = latency_stats([d["timing"] for d in det if d.get("route") == rt], "ttft")
             if rtt.get("n"):
@@ -497,6 +518,22 @@ def main():
     parser.add_argument("--skip-singleturn", action="store_true", help="Skip single-turn eval")
     parser.add_argument("--email", help="Login email — /query requires Bearer auth")
     parser.add_argument("--password", help="Login password")
+    parser.add_argument(
+        "--ids",
+        help="Comma-separated question IDs to run (single-turn only). "
+        "Fast tune loop, e.g. --ids ENUM-01,ENUM-02",
+    )
+    parser.add_argument(
+        "--category",
+        help="Run only single-turn questions in this category, e.g. --category enumeration",
+    )
+    parser.add_argument(
+        "--sources-only",
+        action="store_true",
+        help="Abort each stream after the 'start' event (sources) to skip "
+        "generation — ~10x faster recall eval. Retrieval-only: refusal "
+        "questions are always run to completion (they score on answer text).",
+    )
     args = parser.parse_args()
 
     eval_dir = Path(__file__).parent
@@ -534,18 +571,27 @@ def main():
             print(f"ERROR: {questions_path} not found")
             sys.exit(1)
         questions = load_questions(questions_path)
+        if args.ids:
+            wanted = {q.strip() for q in args.ids.split(",") if q.strip()}
+            questions = [q for q in questions if q["id"] in wanted]
+        if args.category:
+            questions = [q for q in questions if q.get("category") == args.category]
         print(f"Loaded {len(questions)} single-turn questions")
         print(f"\nRunning single-turn retrieval evaluation (top_k={args.top_k})...")
         start = time.time()
-        results = evaluate_retrieval(client, args.api_url, questions, args.top_k, args.verbose)
+        results = evaluate_retrieval(
+            client, args.api_url, questions, args.top_k, args.verbose,
+            sources_only=args.sources_only,
+        )
         elapsed = time.time() - start
         print_report(results, args.top_k)
         print(f"\n  Elapsed: {elapsed:.1f}s ({elapsed / max(results['total'], 1):.1f}s/question)")
         results["elapsed_seconds"] = elapsed
         combined["single_turn"] = results
 
-    # Multi-turn eval
-    if not args.skip_conversations and conversations_path.exists():
+    # Multi-turn eval (skipped when a single-turn subset filter is active)
+    subset_active = bool(args.ids or args.category)
+    if not args.skip_conversations and not subset_active and conversations_path.exists():
         conversations = load_conversations(conversations_path)
         print(f"\nLoaded {len(conversations)} conversation traces")
         print(f"Running multi-turn evaluation...")

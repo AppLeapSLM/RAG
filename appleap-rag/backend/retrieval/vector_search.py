@@ -36,18 +36,21 @@ ATTACHMENT_OVERFETCH = 50
 async def search(
     query: str,
     session: AsyncSession,
-    top_k: int = settings.top_k,
     neighbor_window: int = settings.neighbor_window,
     conversation_id: str | None = None,
     user_email: str | None = None,
 ) -> list[Chunk]:
-    """Hybrid search: vector + keyword → union → cross-encoder rerank → top_k.
+    """Hybrid search: vector + keyword → union → cross-encoder rerank → dynamic
+    top-k (relative-to-top band; see reranker.rerank).
 
     1. Vector search → top VECTOR_OVERFETCH by cosine distance
     2. Keyword search → top KEYWORD_OVERFETCH by ts_rank_cd
        (both retrievers run in parallel)
     3. Union and dedupe by chunk_id — retrieval = coverage
-    4. Cross-encoder rerank all candidates → top_k — reranker = precision
+    4. Cross-encoder rerank all candidates, then keep a relative-to-top score
+       band bounded to [rerank_floor, rerank_max_k] — reranker = precision.
+       (Replaced the fixed top_k slice in V17: an enumeration question keeps
+       all near-equally-relevant docs; a precise question stays tight.)
     5. Optional neighbor expansion (±neighbor_window)
     6. Final results sorted by (document_id, chunk_index) for reading order
 
@@ -130,7 +133,7 @@ async def search(
         len(corpus_vec), len(corpus_kw), len(att_vec), len(att_kw), len(candidates),
     )
 
-    reranked = await rerank(query, candidates, top_k=top_k)
+    reranked = await rerank(query, candidates)
 
     if reranked and neighbor_window > 0:
         reranked = await _expand_neighbors(reranked, session, neighbor_window)
